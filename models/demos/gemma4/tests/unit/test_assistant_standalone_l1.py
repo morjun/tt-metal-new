@@ -2664,24 +2664,23 @@ def test_dense_argmax_real_logits(mesh_device, reset_seeds):
     assistant = rig["assistant"]
     shared_kv, page_tables = rig["shared_kv"], rig["page_tables"]
     pu, pi = rig["pos_uint32"], rig["pos_int32"]
-    R32 = 32
 
-    def _padded(lg):  # exactly spec_decode._argmax_last's rows<32 branch
-        pad = ttnn.pad(lg, [(0, 0), (0, 0), (0, R32 - 1), (0, 0)], value=0.0)
-        u = ttnn.untilize(pad, use_multicore=True)
-        if not _same_buffer(pad, lg):
-            pad.deallocate(True)
-        i = ttnn.argmax(u, dim=-1, keepdim=False)
-        u.deallocate(True)
-        sl = ttnn.slice(i, [0, 0, 0], [1, 1, 1])
-        i.deallocate(True)
-        return sl
+    # Both arms run the production token pick, spec_decode.argmax_last: its padded path via
+    # GEMMA4_ARGMAX_PAD32=1 (set only around that call), its rows==1 fast path otherwise.
+    def _padded(lg):
+        prev = os.environ.get("GEMMA4_ARGMAX_PAD32")
+        os.environ["GEMMA4_ARGMAX_PAD32"] = "1"
+        try:
+            return argmax_last(assistant, lg, rows=1)
+        finally:
+            if prev is None:
+                os.environ.pop("GEMMA4_ARGMAX_PAD32", None)
+            else:
+                os.environ["GEMMA4_ARGMAX_PAD32"] = prev
 
-    def _unpadded(lg):  # the proposed rows==1 fast path
-        u = ttnn.untilize(lg, use_multicore=True)
-        i = ttnn.argmax(u, dim=-1, keepdim=False)
-        u.deallocate(True)
-        return i
+    def _unpadded(lg):
+        assert os.environ.get("GEMMA4_ARGMAX_PAD32", "0") != "1", "unset GEMMA4_ARGMAX_PAD32 for this test"
+        return argmax_last(assistant, lg, rows=1)
 
     tok, h = rig["token"], rig["hidden"]
     agree = ties = defects = 0
