@@ -303,13 +303,13 @@ and it is kept.
 def fig02_argmax_breakdown(out):
     # record §4.4 step breakdown (test_fused_draft_k_steps, ctx 512), x3 = per 3-step draft:
     # the instrument times the 3-step trace and reports it per step, so x3 is its measured value.
-    parts = [("4 decoder layers", BLUE), ("lm_head matmul", ORANGE), ("argmax (token pick)", AQUA)]
+    parts = [("4 decoder layers", BLUE), ("lm_head matmul", ORANGE), ("token selection (convert + argmax)", AQUA)]
     rows = [
         ("After\n(unpadded)", [4.932, 4.233, 0.306], 9.471),
         ("Before\n(padded to 32 rows)", [4.932, 4.233, 4.758], 13.926),
     ]
     fig, a = plt.subplots(figsize=(12, 4.4))
-    draft_breakdown(a, rows, parts, "The argmax was 34% of the draft; now 3%", 16.5)
+    draft_breakdown(a, rows, parts, "Token selection was 34% of the draft; now 3%", 16.5)
     fig.subplots_adjust(bottom=0.28)
     save(
         fig,
@@ -319,10 +319,12 @@ def fig02_argmax_breakdown(out):
 Where the argmax fix comes from, inside one 3-step draft.
 
 Time of a 3-step draft split into the drafter's 4 decoder layers, its lm_head matmul
-(1024 x 262,144) and the argmax that picks each token. The old argmax padded the single logits
-row to 32 rows before reducing it, so every step scanned 32 x 262,144 values (16 MiB) to find one
-index. Reducing the unpadded row returns the same index (verified exact) and cuts the argmax
-from 4.76 to 0.31 ms per draft (15.5x). The layers and the lm_head are unchanged; the draft goes
+(1024 x 262,144) and token selection: everything from the logits to the token id, not the argmax
+kernel alone. The matmul writes the logits in 32-row tiles, and the argmax needs row-major input,
+so token selection always starts with a layout conversion. The old version first padded the
+single logits row to 32 real rows, so every step converted 32 x 262,144 values (16 MiB), ran the
+argmax over 32 rows and kept one index. Converting the unpadded row instead returns the same
+index (verified exact) and cuts token selection from 4.76 to 0.31 ms per draft (15.5x). The layers and the lm_head are unchanged; the draft goes
 from 13.93 to 9.47 ms (-32.0%).
 
 {DRAFT}
@@ -389,7 +391,7 @@ identified reason; with it the tuned medians are -0.51 (shard_mcast) and -0.56 (
 # --------------------------------------------------------------------------- Fig 04
 def fig04_lm_head_breakdown(out):
     # record §5.5.7 step level (4 rotated rounds, identical to +-0.001 ms), x3 = per 3-step draft.
-    parts = [("4 decoder layers", BLUE_L), ("lm_head matmul", ORANGE), ("token pick (argmax)", AQUA)]
+    parts = [("4 decoder layers", BLUE_L), ("lm_head matmul", ORANGE), ("token selection (convert + argmax)", AQUA)]
     rows = [
         ("Split, lm_head part\nas shard_ring", [4.974, 3.774, 0.363], 9.111),
         ("Split, lm_head part\nas shard_mcast", [4.974, 3.660, 0.366], 9.003),
@@ -405,10 +407,11 @@ def fig04_lm_head_breakdown(out):
         f"""
 Where the lm_head gain comes from, inside one 3-step draft.
 
-Time of a 3-step draft split into the drafter's 4 decoder layers, its lm_head matmul and the
-token pick (everything from the logits to the token id). With the pinned part of the lm_head run
-as shard_mcast, the lm_head goes from 4.24 to 3.66 ms per draft and the draft from 9.52 to
-9.00 ms (-5.4%). The token pick grows by 0.06 ms per draft, but not in the argmax itself. The two
+Time of a 3-step draft split into the drafter's 4 decoder layers, its lm_head matmul and token
+selection (everything from the logits to the token id: the layout conversion and the argmax,
+plus a concat when the head is split). With the pinned part of the lm_head run as shard_mcast, the
+lm_head goes from 4.24 to 3.66 ms per draft and the draft from 9.52 to 9.00 ms (-5.4%). Token
+selection grows by 0.06 ms per draft, but not in the argmax itself. The two
 partial logits are each converted to row-major and concatenated into one full 262,144-wide row,
 and a single argmax runs on it, the same input as without the split. The extra 0.06 ms is that
 second conversion and the concat. Running the pinned part as shard_ring instead gives back 0.11 ms
