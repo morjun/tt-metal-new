@@ -32,7 +32,7 @@ import torch
 
 import ttnn
 from models.demos.gemma4.tt import pli_env
-from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits
+from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, _same_buffer
 from models.demos.gemma4.tt.assistant.model import SplitLogits
 
 _FUSED_DBG = os.environ.get("GEMMA4_SPEC_FUSED_DEBUG") == "1"
@@ -61,6 +61,109 @@ def _to_probs(logits_row, temperature, top_p, top_k):
         probs = torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
     s = probs.sum()
     return probs / s if s > 0 else probs
+
+
+def argmax_last(assistant, logits, rows):
+    """argmax over the last (vocab) dim — fast path. Returns [1,1,rows] uint32.
+
+    The ONE implementation of the token pick. ``SpeculativeDecoder._argmax_last`` delegates here,
+    and the standalone drafter rig (``test_assistant_standalone_l1.py``), which has no
+    SpeculativeDecoder, calls it directly -- so every step-level and end-to-end number times the
+    same code. ``assistant`` is only used for the CME head's own argmax.
+
+    ``ttnn.argmax`` requires ROW_MAJOR input; passing a TILE tensor takes a
+    single-core internal-untilize path that is catastrophically slow on a
+    262144-wide vocab (~9 ms for 1 row, ~28 ms for 5). The multicore argmax
+    is fast but ROW-PARALLEL: for 2 <= rows <= 32 it returns GARBAGE unless the row
+    (batch) dim is EXACTLY one tile (32) — verified by a correctness probe
+    (1/5 rows -> wrong; padded to 32 -> exact; and >32 rows in one call also
+    returns garbage beyond the first tile). So process the rows in 32-row
+    chunks: pad each ≤32-row chunk up to 32, run the multicore untilize +
+    argmax, slice back, and concat. Net ~1.6 ms/chunk vs ~9-28 ms bare.
+
+    Under Centroid Masked Embedding the drafter's ``logits`` is a compact
+    ``CmeLogits`` pair instead of a dense vocab row; the head does its own
+    argmax over the ~4096 candidates and maps the winner back to a vocab id on
+    device, returning the same [1,1,rows] uint32 contract. Target verify
+    logits stay dense, so they take the path below.
+    """
+    if isinstance(logits, CmeLogits):
+        return assistant.masked_embedding.argmax_token_id(logits, rows)
+    if isinstance(logits, SplitLogits):
+        if rows > 32:
+            raise NotImplementedError("SplitLogits argmax is untested above 32 rows (drafter uses rows=1)")
+        # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
+        # drops the physical 32-row pad, so the concat moves one real row rather
+        # than 32 (the tax §2.10 removed). Concatenating in vocab-column order
+        # makes the returned index already a vocab id -- no offset arithmetic.
+        # The alternative, argmax per part and pick the larger, needs each
+        # part's max VALUE, and ttnn.max is slower than argmax itself (§2.10).
+        rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
+        joined = ttnn.concat(rm, dim=-1)
+        for t in rm:
+            t.deallocate(True)
+        idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
+        joined.deallocate(True)
+        # NO slice back: after untilize the argmax is over `rows` real rows already.
+        # An earlier cut kept the padded path's slice; at full extent ttnn returns it
+        # as a VIEW, and freeing idx then freed the result under it.
+        return idx
+    R32 = 32
+    if rows > R32:
+        # Batched packed verify (B*P > 32): argmax each 32-row tile separately
+        # (offsets are multiples of 32, so the TILE slices are tile-aligned)
+        # and concat — a single >32-row multicore argmax garbles later tiles.
+        vocab = logits.shape[-1]
+        chunks = []
+        off = 0
+        while off < rows:
+            n = min(R32, rows - off)
+            part = ttnn.slice(logits, [0, 0, off, 0], [1, 1, off + n, vocab])
+            chunks.append(argmax_last(assistant, part, n))  # recurse (≤32 rows)
+            part.deallocate(True)
+            off += n
+        out = ttnn.concat(chunks, dim=2)  # [1,1,rows]
+        for c in chunks:
+            c.deallocate(True)
+        return out
+    # rows == 1 (every drafter step) needs NO padding. Untilizing the [1,1,1,V]
+    # TILE tensor drops the physical 32-row pad outright, and argmax over the
+    # resulting single ROW_MAJOR row is both correct and far cheaper -- there is
+    # nothing to slice back. Same fix as masked_embedding._argmax_rows took in
+    # fd652d14217 for the CME head; the dense path had been left behind.
+    # MEASURED at the real width (test_dense_argmax_rows1, N=262144, bf16):
+    # padded 1583.4 us vs unpadded 102.0 us -- 15.5x -- and the unpadded index is
+    # exact in 16/16 cells (bf16+fp32, rows 1 and 5, max at first/middle/last/
+    # random). The docstring's "returns GARBAGE unless the row dim is EXACTLY one
+    # tile" does not hold at rows==1. Token identity on REAL drafter logits is
+    # covered by test_dense_argmax_real_logits (16/16, zero ties).
+    # rows in 2..31 keeps the pad-to-32 path: >32-row behaviour is untested and the
+    # packed-verify caller reaches this through the 32-row chunking above.
+    # GEMMA4_ARGMAX_PAD32=1 restores the old pad-to-32 path. It exists so the
+    # before/after can be measured in ONE session rather than against a figure
+    # recorded days earlier, and as a rollback if the fast path ever misbehaves.
+    if rows == 1 and os.environ.get("GEMMA4_ARGMAX_PAD32", "0") != "1":
+        u = ttnn.untilize(logits, use_multicore=True)
+        idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,1] uint32 RM
+        u.deallocate(True)
+        return idx
+    src = logits
+    padded = None
+    if rows < R32:
+        padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
+        src = padded
+    u = ttnn.untilize(src, use_multicore=True)
+    if padded is not None and not _same_buffer(padded, logits):
+        padded.deallocate(True)
+    idx = ttnn.argmax(
+        u, dim=-1, keepdim=False
+    )  # [1,1,32 or rows] uint32 RM (multicore by default on ROW_MAJOR last-dim)
+    u.deallocate(True)
+    if rows < R32:
+        sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])  # [1,1,rows]
+        idx.deallocate(True)
+        idx = sliced
+    return idx
 
 
 class SpeculativeDecoder:
@@ -1015,101 +1118,8 @@ class SpeculativeDecoder:
 
     # ── fully on-device fused iteration (greedy) ─────────────────────────────
     def _argmax_last(self, logits, rows):
-        """argmax over the last (vocab) dim — fast path. Returns [1,1,rows] uint32.
-
-        ``ttnn.argmax`` requires ROW_MAJOR input; passing a TILE tensor takes a
-        single-core internal-untilize path that is catastrophically slow on a
-        262144-wide vocab (~9 ms for 1 row, ~28 ms for 5). The multicore argmax
-        is fast but ROW-PARALLEL: for 2 <= rows <= 32 it returns GARBAGE unless the row
-        (batch) dim is EXACTLY one tile (32) — verified by a correctness probe
-        (1/5 rows -> wrong; padded to 32 -> exact; and >32 rows in one call also
-        returns garbage beyond the first tile). So process the rows in 32-row
-        chunks: pad each ≤32-row chunk up to 32, run the multicore untilize +
-        argmax, slice back, and concat. Net ~1.6 ms/chunk vs ~9-28 ms bare.
-
-        Under Centroid Masked Embedding the drafter's ``logits`` is a compact
-        ``CmeLogits`` pair instead of a dense vocab row; the head does its own
-        argmax over the ~4096 candidates and maps the winner back to a vocab id on
-        device, returning the same [1,1,rows] uint32 contract. Target verify
-        logits stay dense, so they take the path below.
-        """
-        if isinstance(logits, CmeLogits):
-            return self.assistant.masked_embedding.argmax_token_id(logits, rows)
-        if isinstance(logits, SplitLogits):
-            if rows > 32:
-                raise NotImplementedError("SplitLogits argmax is untested above 32 rows (drafter uses rows=1)")
-            # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
-            # drops the physical 32-row pad, so the concat moves one real row rather
-            # than 32 (the tax §2.10 removed). Concatenating in vocab-column order
-            # makes the returned index already a vocab id -- no offset arithmetic.
-            # The alternative, argmax per part and pick the larger, needs each
-            # part's max VALUE, and ttnn.max is slower than argmax itself (§2.10).
-            rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
-            joined = ttnn.concat(rm, dim=-1)
-            for t in rm:
-                t.deallocate(True)
-            idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
-            joined.deallocate(True)
-            # NO slice back: after untilize the argmax is over `rows` real rows already.
-            # An earlier cut kept the padded path's slice; at full extent ttnn returns it
-            # as a VIEW, and freeing idx then freed the result under it.
-            return idx
-        R32 = 32
-        if rows > R32:
-            # Batched packed verify (B*P > 32): argmax each 32-row tile separately
-            # (offsets are multiples of 32, so the TILE slices are tile-aligned)
-            # and concat — a single >32-row multicore argmax garbles later tiles.
-            vocab = logits.shape[-1]
-            chunks = []
-            off = 0
-            while off < rows:
-                n = min(R32, rows - off)
-                part = ttnn.slice(logits, [0, 0, off, 0], [1, 1, off + n, vocab])
-                chunks.append(self._argmax_last(part, n))  # recurse (≤32 rows)
-                part.deallocate(True)
-                off += n
-            out = ttnn.concat(chunks, dim=2)  # [1,1,rows]
-            for c in chunks:
-                c.deallocate(True)
-            return out
-        # rows == 1 (every drafter step) needs NO padding. Untilizing the [1,1,1,V]
-        # TILE tensor drops the physical 32-row pad outright, and argmax over the
-        # resulting single ROW_MAJOR row is both correct and far cheaper -- there is
-        # nothing to slice back. Same fix as masked_embedding._argmax_rows took in
-        # fd652d14217 for the CME head; the dense path had been left behind.
-        # MEASURED at the real width (test_dense_argmax_rows1, N=262144, bf16):
-        # padded 1583.4 us vs unpadded 102.0 us -- 15.5x -- and the unpadded index is
-        # exact in 16/16 cells (bf16+fp32, rows 1 and 5, max at first/middle/last/
-        # random). The docstring's "returns GARBAGE unless the row dim is EXACTLY one
-        # tile" does not hold at rows==1. Token identity on REAL drafter logits is
-        # covered by test_dense_argmax_real_logits (16/16, zero ties).
-        # rows in 2..31 keeps the pad-to-32 path: >32-row behaviour is untested and the
-        # packed-verify caller reaches this through the 32-row chunking above.
-        # GEMMA4_ARGMAX_PAD32=1 restores the old pad-to-32 path. It exists so the
-        # before/after can be measured in ONE session rather than against a figure
-        # recorded days earlier, and as a rollback if the fast path ever misbehaves.
-        if rows == 1 and os.environ.get("GEMMA4_ARGMAX_PAD32", "0") != "1":
-            u = ttnn.untilize(logits, use_multicore=True)
-            idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,1] uint32 RM
-            u.deallocate(True)
-            return idx
-        src = logits
-        padded = None
-        if rows < R32:
-            padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
-            src = padded
-        u = ttnn.untilize(src, use_multicore=True)
-        if padded is not None:
-            padded.deallocate(True)
-        idx = ttnn.argmax(
-            u, dim=-1, keepdim=False
-        )  # [1,1,32 or rows] uint32 RM (multicore by default on ROW_MAJOR last-dim)
-        u.deallocate(True)
-        if rows < R32:
-            sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])  # [1,1,rows]
-            idx.deallocate(True)
-            idx = sliced
-        return idx
+        """Token pick; see the module-level :func:`argmax_last` (shared with the drafter rig)."""
+        return argmax_last(self.assistant, logits, rows)
 
     def _id_to_host(self, id_tt):
         """[*,1] uint32 device id -> python int (TP: read device-0 replica)."""

@@ -63,6 +63,7 @@ from models.demos.gemma4.tt.ccl import CCLManager, ccl_allgather, ccl_allreduce
 from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner, derive_decode_1d_config
 from models.demos.gemma4.tt.model import create_rope_caches
 from models.demos.gemma4.tt.model_config import Gemma4AssistantArgs
+from models.demos.gemma4.tt.spec_decode import argmax_last
 from models.demos.gemma4.tt.weight_placement import WeightPlacement
 from models.tt_transformers.tt.common import PagedAttentionConfig
 
@@ -367,57 +368,6 @@ def _time_traced_step(mesh_device, rig, return_logits, reps=TRACE_REPS):
     return ms
 
 
-def _argmax_token(assistant, logits, rows=1):
-    """Next-token id as a DEVICE [1,1,rows] uint32 tensor. Mirrors SpeculativeDecoder._argmax_last.
-
-    Under CME the head does its own argmax over the ~4096 candidates and maps the
-    winner back to a vocab id on device. The dense fallback needs the pad-to-32
-    dance because ``ttnn.argmax``'s multicore path is row-parallel and returns
-    garbage unless the row dim is exactly one tile.
-    """
-    if isinstance(logits, CmeLogits):
-        return assistant.masked_embedding.argmax_token_id(logits, rows)
-    if isinstance(logits, SplitLogits):
-        # Untilize each part, concatenate ROW_MAJOR, then ONE argmax. Untilizing
-        # drops the physical 32-row pad, so the concat moves `rows` real rows and
-        # the argmax already returns [1,1,rows] -- there is NO slice back. (An
-        # earlier cut kept the padded path's slice; at full extent ttnn returns it
-        # as a VIEW, and freeing idx then freed the result under it.) Concatenating
-        # in vocab-column order makes the index already a vocab id. The alternative,
-        # argmax per part and pick the larger, needs each part's max VALUE, and
-        # ttnn.max is slower than argmax itself (PERFORMANCE_TRAJECTORY §2.10).
-        if rows > 32:
-            raise NotImplementedError("SplitLogits argmax is untested above 32 rows (drafter uses rows=1)")
-        rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
-        joined = ttnn.concat(rm, dim=-1)
-        for t in rm:
-            t.deallocate(True)
-        idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
-        joined.deallocate(True)
-        return idx
-    R32 = 32
-    # Mirrors spec_decode._argmax_last's rows==1 fast path (see the rationale there).
-    if rows == 1:
-        u = ttnn.untilize(logits, use_multicore=True)
-        idx = ttnn.argmax(u, dim=-1, keepdim=False)
-        u.deallocate(True)
-        return idx
-    src, padded = logits, None
-    if rows < R32:
-        padded = ttnn.pad(logits, [(0, 0), (0, 0), (0, R32 - rows), (0, 0)], value=0.0)
-        src = padded
-    u = ttnn.untilize(src, use_multicore=True)
-    if padded is not None and not _same_buffer(padded, logits):
-        padded.deallocate(True)
-    idx = ttnn.argmax(u, dim=-1, keepdim=False)
-    u.deallocate(True)
-    if rows < R32:
-        sliced = ttnn.slice(idx, [0, 0, 0], [1, 1, rows])
-        idx.deallocate(True)
-        idx = sliced
-    return idx
-
-
 def _make_fused_k_body(rig, k, mode="full"):
     """Canonical traced workload; construction emits no device operations."""
     if k < 1 or mode not in {"full", "no_argmax", "backbone"}:
@@ -433,7 +383,7 @@ def _make_fused_k_body(rig, k, mode="full"):
         for _ in range(k):
             logits, h = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=want_logits)
             if mode == "full":
-                last = _argmax_token(assistant, logits, rows=1)
+                last = argmax_last(assistant, logits, rows=1)
                 logits.deallocate(True)
                 # ROW_MAJOR reshape is a free VIEW of `last`. Never deallocate
                 # either one: freeing the view hands its storage back and a later
@@ -570,7 +520,7 @@ def _time_per_step_replay(mesh_device, rig, k, reps=max(4, TRACE_REPS // 8)):
             ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
             if step < k - 1:
                 ttnn.copy(h_next, h_in)  # the trace cannot update its own input
-            idx = _argmax_token(assistant, logits, rows=1)  # eager, not traced
+            idx = argmax_last(assistant, logits, rows=1)  # eager, not traced
             t = ttnn.to_torch(ttnn.get_device_tensors(idx)[0] if tp > 1 else idx)
             tok = int(t.reshape(-1)[0])
             idx.deallocate(True)
@@ -1512,7 +1462,7 @@ def test_op_inventory(mesh_device, reset_seeds):
     try:
         logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
         ttnn.synchronize_device(mesh_device)
-        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        idx = argmax_last(rig["assistant"], logits, rows=1)
         ttnn.synchronize_device(mesh_device)
     finally:
         graph = ttnn.graph.end_graph_capture()
@@ -1574,7 +1524,7 @@ def test_cb_high_water(mesh_device, reset_seeds):
     try:
         logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
         ttnn.synchronize_device(mesh_device)
-        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        idx = argmax_last(rig["assistant"], logits, rows=1)
         ttnn.synchronize_device(mesh_device)
     finally:
         graph = ttnn.graph.end_graph_capture()
@@ -1981,7 +1931,7 @@ def test_layout_conversion_sites(mesh_device, reset_seeds):
         try:
             logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
             ttnn.synchronize_device(mesh_device)
-            idx = _argmax_token(rig["assistant"], logits, rows=1)
+            idx = argmax_last(rig["assistant"], logits, rows=1)
             ttnn.synchronize_device(mesh_device)
         finally:
             graph = ttnn.graph.end_graph_capture()
@@ -2044,7 +1994,7 @@ def test_op_shape_discovery(mesh_device, reset_seeds):
     try:
         logits, hn = rig["assistant"].step(*_step_args(rig), return_logits=True)
         ttnn.synchronize_device(mesh_device)
-        idx = _argmax_token(rig["assistant"], logits, rows=1)
+        idx = argmax_last(rig["assistant"], logits, rows=1)
         ttnn.synchronize_device(mesh_device)
     finally:
         graph = ttnn.graph.end_graph_capture()
@@ -2311,7 +2261,7 @@ def test_lm_head_split(mesh_device, reset_seeds):
                 host = torch.cat([ttnn.to_torch(p).reshape(-1) for p in lg.parts]).float()
             else:
                 host = ttnn.to_torch(lg).reshape(-1).float()
-            idx = _argmax_token(a, lg, rows=1)
+            idx = argmax_last(a, lg, rows=1)
             ttnn.synchronize_device(mesh_device)
             t = int(ttnn.to_torch(idx).reshape(-1)[0])
             idx.deallocate(True)
@@ -2510,12 +2460,12 @@ def test_lm_head_split(mesh_device, reset_seeds):
         f"untilize(DRAM part {int(tp_.shape[-1])}) max|d|={d_t} | concat numel={jt.numel()} max|d|={d_j} | "
         f"argmax device={dev_idx} host={host_idx} equal={dev_idx == host_idx}"
     )
-    comb_idx = _argmax_token(a, split_logits, rows=1)
+    comb_idx = argmax_last(a, split_logits, rows=1)
     comb = int(ttnn.to_torch(comb_idx).reshape(-1)[0])
-    logger.info(f"[lm-split] _argmax_token(SplitLogits) = {comb} (host truth {host_idx}) equal={comb == host_idx}")
+    logger.info(f"[lm-split] argmax_last(SplitLogits) = {comb} (host truth {host_idx}) equal={comb == host_idx}")
     for t_ in (h_rm, t_rm, joined, di, comb_idx):
         t_.deallocate(True)
-    t_argmax_split = _op_timed(mesh_device, lambda: _argmax_token(a, split_logits, rows=1), protect=(hp, tp_))
+    t_argmax_split = _op_timed(mesh_device, lambda: argmax_last(a, split_logits, rows=1), protect=(hp, tp_))
     hp.deallocate(True)
     tp_.deallocate(True)
 
