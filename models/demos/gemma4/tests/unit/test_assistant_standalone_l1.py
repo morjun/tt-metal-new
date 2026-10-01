@@ -2644,6 +2644,103 @@ def test_lm_head_split(mesh_device, reset_seeds):
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])
+def test_dense_argmax_multirow(mesh_device, reset_seeds):
+    """Is the unpadded multicore argmax correct for EVERY row count 1..32, at the real width?
+
+    The gate for dropping the pad-to-32 on multi-row callers (the target verify argmaxes
+    rows = K+1 every iteration). `argmax_last`'s docstring once claimed the multicore argmax
+    "returns GARBAGE unless the row dim is EXACTLY one tile"; test_dense_argmax_rows1 showed it
+    false at rows 1 and 5 only. Both arms here run the PRODUCTION token pick,
+    `spec_decode.argmax_last`: unpadded (GEMMA4_ARGMAX_PAD32 unset) and padded (=1).
+
+    (a) planted: every row gets a strictly unique max (+1.0 against values in [-1, -0.5]) at a
+        row-dependent position cycling first / last / middle / scattered, because a kernel that
+        mis-splits work fails positionally. Both arms must equal the host argmax exactly.
+    (b) natural: random normal data, where bf16 can tie. The arms must agree index for index;
+        a disagreement is a defect unless both indices hold the same value.
+    Then both arms are timed (traced, op level) at a few row counts.
+    """
+    N = int(os.getenv("GEMMA4_ARGMAX_N", "262144"))
+    rows_list = list(range(1, 33))
+    timed_rows = (1, 4, 5, 8, 16, 31)
+
+    def _pick(src, rows, padded):
+        prev = os.environ.get("GEMMA4_ARGMAX_PAD32")
+        if padded:
+            os.environ["GEMMA4_ARGMAX_PAD32"] = "1"
+        else:
+            os.environ.pop("GEMMA4_ARGMAX_PAD32", None)
+        try:
+            return argmax_last(None, src, rows)
+        finally:
+            if prev is None:
+                os.environ.pop("GEMMA4_ARGMAX_PAD32", None)
+            else:
+                os.environ["GEMMA4_ARGMAX_PAD32"] = prev
+
+    def _idx(src, rows, padded):
+        out = _pick(src, rows, padded)
+        ttnn.synchronize_device(mesh_device)
+        v = ttnn.to_torch(out).reshape(-1)[:rows].to(torch.int64)
+        out.deallocate(True)
+        return v
+
+    planted_fail, natural_defect, natural_tiebreak = [], [], 0
+    timings = []
+    for dtype, dname in ((ttnn.bfloat16, "bf16"), (ttnn.float32, "fp32")):
+        for rows in rows_list:
+            g = torch.Generator().manual_seed(1000 * rows + (0 if dname == "bf16" else 1))
+            # (a) planted unique max
+            t = -torch.rand(1, 1, rows, N, generator=g) * 0.5 - 0.5
+            for r in range(rows):
+                pos = (0, N - 1, N // 2, (r * 104729 + 13) % N)[r % 4]
+                t[0, 0, r, pos] = 1.0
+            if dtype == ttnn.bfloat16:
+                t = t.bfloat16().float()
+            gold = t[0, 0].argmax(dim=-1)
+            src = ttnn.from_torch(t, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=dtype)
+            fast, padv = _idx(src, rows, False), _idx(src, rows, True)
+            for arm, got in (("unpadded", fast), ("padded", padv)):
+                bad = int((got != gold).sum())
+                if bad:
+                    planted_fail.append((dname, rows, arm, bad))
+            if dtype == ttnn.bfloat16 and rows in timed_rows:
+                us = {
+                    arm: _op_timed(mesh_device, lambda arm=arm: _pick(src, rows, arm == "padded"), protect=(src,))
+                    for arm in ("unpadded", "padded")
+                }
+                timings.append((rows, us["padded"], us["unpadded"]))
+            src.deallocate(True)
+            # (b) natural data: the arms must agree, or tie exactly
+            t2 = torch.randn(1, 1, rows, N, generator=g)
+            if dtype == ttnn.bfloat16:
+                t2 = t2.bfloat16().float()
+            src2 = ttnn.from_torch(t2, device=mesh_device, layout=ttnn.TILE_LAYOUT, dtype=dtype)
+            f2, p2 = _idx(src2, rows, False), _idx(src2, rows, True)
+            src2.deallocate(True)
+            for r in torch.nonzero(f2 != p2).flatten().tolist():
+                if float(t2[0, 0, r, f2[r]]) == float(t2[0, 0, r, p2[r]]):
+                    natural_tiebreak += 1
+                else:
+                    natural_defect.append((dname, rows, r, int(f2[r]), int(p2[r])))
+            logger.info(
+                f"[argmax-multirow] {dname} rows={rows:2d} planted unpadded={'ok' if not any(f[:3] == (dname, rows, 'unpadded') for f in planted_fail) else 'FAIL'} "
+                f"padded={'ok' if not any(f[:3] == (dname, rows, 'padded') for f in planted_fail) else 'FAIL'} "
+                f"| natural arms agree {int((f2 == p2).sum())}/{rows}"
+            )
+    for rows, tp, tu in timings:
+        logger.info(
+            f"[argmax-multirow] bf16 rows={rows:2d} padded {tp:8.1f} us | unpadded {tu:8.1f} us | {tp / tu:5.1f}x"
+        )
+    logger.info(
+        f"[argmax-multirow] ===== planted failures {len(planted_fail)} | natural defects {len(natural_defect)} "
+        f"| natural tie-break differences {natural_tiebreak} | N={N}"
+    )
+    assert not planted_fail, f"wrong index on planted data: {planted_fail}"
+    assert not natural_defect, f"arms disagree on non-tied values: {natural_defect}"
+
+
+@parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)])
 def test_dense_argmax_real_logits(mesh_device, reset_seeds):
     """Do padded and unpadded argmax pick the SAME token on REAL drafter logits?
 

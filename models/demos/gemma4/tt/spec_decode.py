@@ -73,13 +73,15 @@ def argmax_last(assistant, logits, rows):
 
     ``ttnn.argmax`` requires ROW_MAJOR input; passing a TILE tensor takes a
     single-core internal-untilize path that is catastrophically slow on a
-    262144-wide vocab (~9 ms for 1 row, ~28 ms for 5). The multicore argmax
-    is fast but ROW-PARALLEL: for 2 <= rows <= 32 it returns GARBAGE unless the row
-    (batch) dim is EXACTLY one tile (32) — verified by a correctness probe
-    (1/5 rows -> wrong; padded to 32 -> exact; and >32 rows in one call also
-    returns garbage beyond the first tile). So process the rows in 32-row
-    chunks: pad each ≤32-row chunk up to 32, run the multicore untilize +
-    argmax, slice back, and concat. Net ~1.6 ms/chunk vs ~9-28 ms bare.
+    262144-wide vocab (~9 ms for 1 row, ~28 ms for 5). So the logits are first
+    untilized (multicore), then argmaxed with the multicore ROW_MAJOR kernel,
+    which splits the VOCAB dim across cores. Rows <= 32 are handled in one call
+    with NO padding. An older claim here -- that the multicore argmax "returns
+    GARBAGE unless the row dim is EXACTLY one tile (32)" -- is false at N=262144
+    for every row count 1..32 in bf16 and fp32 (test_dense_argmax_multirow:
+    exact on planted maxima, index-identical to the padded path on random data).
+    The same old probe also claimed >32 rows in one call garble beyond the first
+    tile; that is untested, so >32 rows are still argmaxed in 32-row chunks.
 
     Under Centroid Masked Embedding the drafter's ``logits`` is a compact
     ``CmeLogits`` pair instead of a dense vocab row; the head does its own
@@ -126,25 +128,23 @@ def argmax_last(assistant, logits, rows):
         for c in chunks:
             c.deallocate(True)
         return out
-    # rows == 1 (every drafter step) needs NO padding. Untilizing the [1,1,1,V]
-    # TILE tensor drops the physical 32-row pad outright, and argmax over the
-    # resulting single ROW_MAJOR row is both correct and far cheaper -- there is
-    # nothing to slice back. Same fix as masked_embedding._argmax_rows took in
-    # fd652d14217 for the CME head; the dense path had been left behind.
-    # MEASURED at the real width (test_dense_argmax_rows1, N=262144, bf16):
-    # padded 1583.4 us vs unpadded 102.0 us -- 15.5x -- and the unpadded index is
-    # exact in 16/16 cells (bf16+fp32, rows 1 and 5, max at first/middle/last/
-    # random). The docstring's "returns GARBAGE unless the row dim is EXACTLY one
-    # tile" does not hold at rows==1. Token identity on REAL drafter logits is
-    # covered by test_dense_argmax_real_logits (16/16, zero ties).
-    # rows in 2..31 keeps the pad-to-32 path: >32-row behaviour is untested and the
-    # packed-verify caller reaches this through the 32-row chunking above.
-    # GEMMA4_ARGMAX_PAD32=1 restores the old pad-to-32 path. It exists so the
-    # before/after can be measured in ONE session rather than against a figure
-    # recorded days earlier, and as a rollback if the fast path ever misbehaves.
-    if rows == 1 and os.environ.get("GEMMA4_ARGMAX_PAD32", "0") != "1":
+    # No padding for rows <= 32. Untilizing a [1,1,rows,V] TILE tensor writes only the `rows`
+    # logical rows (the physical tile pad is dropped), and the multicore argmax splits the VOCAB
+    # dim across cores -- each core loops over every row of its slice -- so its work split does
+    # not depend on the row count. rows == 1 is every drafter step (522851915e4: padded 1583.4 us
+    # vs unpadded 102.0 us at N=262144, 15.5x). rows == K+1 is the target verify.
+    # Correctness for every row count 1..32, bf16 and fp32, against a host argmax:
+    # test_dense_argmax_multirow. Same fix as masked_embedding._argmax_rows took in fd652d14217
+    # for the CME head.
+    # GEMMA4_ARGMAX_PAD32 restores the old pad-to-32 path, so a before/after is measured in ONE
+    # session and the fast path can be rolled back:
+    #   1         -> pad every row count < 32 (the state before 522851915e4);
+    #   multirow  -> pad 2..31 rows only (the state before the verify fix).
+    pad_mode = (os.environ.get("GEMMA4_ARGMAX_PAD32") or "0").strip().lower()
+    pad = pad_mode in ("1", "true", "yes", "on") or (pad_mode == "multirow" and rows > 1)
+    if not pad:
         u = ttnn.untilize(logits, use_multicore=True)
-        idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,1] uint32 RM
+        idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
         u.deallocate(True)
         return idx
     src = logits
