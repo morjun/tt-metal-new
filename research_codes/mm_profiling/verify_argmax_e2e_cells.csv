@@ -1,0 +1,15 @@
+round,slot,arm,warmup,n_iters,ms_per_iter,tok_s_u,accept,l1_mb,l1_tensors,text_sha
+0,0,pad_multirow,True,191,100.42,26.07,1.62,0.0,0,684888c0ebb17f37
+0,1,unpadded,True,191,98.94,26.46,1.62,0.0,0,684888c0ebb17f37
+1,0,unpadded,False,191,98.91,26.47,1.62,0.0,0,684888c0ebb17f37
+1,1,pad_multirow,False,191,100.34,26.09,1.62,0.0,0,684888c0ebb17f37
+2,0,pad_multirow,False,191,100.36,26.08,1.62,0.0,0,684888c0ebb17f37
+2,1,unpadded,False,191,99.15,26.4,1.62,0.0,0,684888c0ebb17f37
+3,0,unpadded,False,191,99.02,26.44,1.62,0.0,0,684888c0ebb17f37
+3,1,pad_multirow,False,191,100.37,26.08,1.62,0.0,0,684888c0ebb17f37
+4,0,pad_multirow,False,191,100.5,26.05,1.62,0.0,0,684888c0ebb17f37
+4,1,unpadded,False,191,99.0,26.44,1.62,0.0,0,684888c0ebb17f37
+5,0,unpadded,False,191,98.92,26.47,1.62,0.0,0,684888c0ebb17f37
+5,1,pad_multirow,False,191,100.31,26.1,1.62,0.0,0,684888c0ebb17f37
+6,0,pad_multirow,False,191,100.35,26.09,1.62,0.0,0,684888c0ebb17f37
+6,1,unpadded,False,191,98.96,26.45,1.62,0.0,0,684888c0ebb17f37
