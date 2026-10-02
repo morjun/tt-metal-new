@@ -452,3 +452,53 @@ DISABLED = DecodeMatmulTuner(enabled=False)
 
 def resolve(tuner):
     return tuner if tuner is not None else DISABLED
+
+
+def lm_head_out_block_w_config(env_name, x, w):
+    """Explicit 1D-mcast config for an lm_head call, fixing only ``out_block_w``. Opt-in.
+
+    Returns ``(program_config, compute_kernel_config)``, or ``(None, None)`` when ``env_name`` is
+    unset, which leaves the call on ttnn's automatic config.
+
+    The automatic path sizes ``out_block_w`` against the free L1 (lowest occupied L1 address), so
+    pinning anything re-blocks these calls as a side effect. Everything except ``out_block_w``
+    restates what the automatic path resolves to for these shapes (M = 1 tile row):
+    the full compute grid, ``per_core_N = ceil(ceil(N / cores) / 32)``, ``in0_block_w = 2`` when Kt
+    is even, ``out_subblock_w`` = largest divisor of ``out_block_w`` <= 8, and HiFi2 with packer L1
+    accumulation. ``out_block_w`` only changes how N is split into passes, not any tile's K-sum, so
+    the output is bit-identical to the automatic config (gemma4-12b/MEASUREMENT_RECORD.md §5.5.12).
+    """
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return None, None
+    out_block_w = int(raw)
+    device = x.device()
+    grid = device.compute_with_storage_grid_size()
+    cores = grid.x * grid.y
+    T = ttnn.TILE_SIZE
+    k, n = int(w.shape[-2]), int(w.shape[-1])
+    per_core_n = -(-(-(-n // cores)) // T)
+    if per_core_n % out_block_w:
+        raise ValueError(f"{env_name}={out_block_w} must divide per_core_N={per_core_n} (N={n}, {cores} cores)")
+    pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+        in0_block_w=2 if (k // T) % 2 == 0 else 1,
+        out_subblock_h=1,
+        out_subblock_w=max(d for d in range(1, 9) if out_block_w % d == 0),
+        out_block_h=1,
+        out_block_w=out_block_w,
+        per_core_M=1,
+        per_core_N=per_core_n,
+        fuse_batch=False,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+    ckc = ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=True,
+    )
+    logger.info(f"[lm-head-obw] {env_name}: N={n} per_core_N={per_core_n} out_block_w={out_block_w}")
+    return pc, ckc

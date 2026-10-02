@@ -45,7 +45,7 @@ from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbe
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
-from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner, lm_head_out_block_w_config
 from models.demos.gemma4.tt.matmul_tuning import resolve as resolve_tuner
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.weight_placement import WeightPlacement, place_as_tensor
@@ -488,13 +488,15 @@ class Gemma4AssistantModel:
                         program_config=self.lm_head_l1_pc,
                         compute_kernel_config=self.lm_head_l1_ckc,
                     )
-                tail = ttnn.linear(normed, self.lm_head)
+                obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
+                tail = ttnn.linear(normed, self.lm_head, program_config=obw_pc, compute_kernel_config=obw_ckc)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     head = ccl_allgather(head, self.mesh_config, self.ccl_manager)
                     tail = ccl_allgather(tail, self.mesh_config, self.ccl_manager)
                 logits = SplitLogits(parts=(head, tail))
             else:
-                logits = ttnn.linear(normed, self.lm_head)
+                obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
+                logits = ttnn.linear(normed, self.lm_head, program_config=obw_pc, compute_kernel_config=obw_ckc)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)
 

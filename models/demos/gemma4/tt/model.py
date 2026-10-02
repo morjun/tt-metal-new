@@ -27,7 +27,7 @@ from models.common.sampling.generator import SamplingGenerator
 from models.demos.gemma4.tt import pli_env
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
-from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner
+from models.demos.gemma4.tt.matmul_tuning import DecodeMatmulTuner, lm_head_out_block_w_config
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.weight_placement import WeightPlacement, shard_l1_width
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
@@ -1225,7 +1225,12 @@ class Gemma4Model:
                 k=self.hidden_size,
                 n=self.lm_head_weight.shape[-1],
             )
-            logits = ttnn.linear(hidden_states, self.lm_head_weight, program_config=lm_head_pc)
+            obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_TARGET_OBW", hidden_states, self.lm_head_weight)
+            if obw_pc is not None:
+                lm_head_pc = obw_pc
+            logits = ttnn.linear(
+                hidden_states, self.lm_head_weight, program_config=lm_head_pc, compute_kernel_config=obw_ckc
+            )
             hidden_states.deallocate(True)
         else:
             logits = hidden_states
