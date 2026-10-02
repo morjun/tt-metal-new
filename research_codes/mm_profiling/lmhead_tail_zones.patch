@@ -1,0 +1,83 @@
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+index 73277fd9b23..d0792e4640d 100644
+--- a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_receiver.cpp
+@@ -71,7 +71,7 @@ void kernel_main() {
+             for (uint32_t bw = 0; bw < num_blocks_w_dim; ++bw) {
+                 for (uint32_t block = 0; block < num_blocks_inner_dim; ++block) {
+                     // Operand 0
+-                    dfb_in0.reserve_back(in0_block_num_tiles);
++                    { DeviceZoneScopedSumN2("IN0_RX_SLOT_WAIT"); dfb_in0.reserve_back(in0_block_num_tiles); }
+ 
+                     // Set in0 semaphore value to INVALID
+                     receiver_sem.set(INVALID);
+@@ -80,7 +80,7 @@ void kernel_main() {
+                     sender_sem.up(noc, in0_mcast_sender_noc_x, in0_mcast_sender_noc_y, 1);
+ 
+                     // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
+-                    receiver_sem.wait(VALID);
++                    { DeviceZoneScopedSumN1("IN0_RX_WAIT"); receiver_sem.wait(VALID); }
+ 
+                     dfb_in0.push_back(in0_block_num_tiles);
+                 }
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+index 80aa2f74a1a..95175c43a78 100644
+--- a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in0_sender_padding.cpp
+@@ -292,7 +292,7 @@ void kernel_main() {
+                         in0_tensor_current_inner_dim_block_start_tile_id += in0_tensor_next_inner_dim_block_stride;
+ 
+                         // Barrier! make sure the reads are done
+-                        noc.async_read_barrier();
++                        { DeviceZoneScopedSumN1("IN0_SND_DRAM"); noc.async_read_barrier(); }
+ #else
+                         if constexpr (extract_shard_sub_blocks) {
+                             uint32_t l1_write_addr_in0 = dfb_in0.get_write_ptr();
+@@ -349,7 +349,7 @@ void kernel_main() {
+                         // wait until all in0 mcast destinations have atomically incremented the in0 semaphore_addr
+                         // (i.e. its value should be in0_mcast_num_dests), then reset the semaphore_addr value back to
+                         // zero for the next block
+-                        sender_sem.wait(in0_mcast_num_dests);
++                        { DeviceZoneScopedSumN2("IN0_SND_RX_READY"); sender_sem.wait(in0_mcast_num_dests); }
+                         sender_sem.set(0);
+ 
+                         // Now we have the block in the CB address, we can mcast to dests!
+diff --git a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+index 15fb3170f25..880771c2de2 100644
+--- a/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
++++ b/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_bmm_tile_layout_in1_sender_writer_padding.cpp
+@@ -385,7 +385,7 @@ void kernel_main() {
+                         noc.async_read_barrier();
+ #elif !defined(IN1_SHARDED)
+                         // Operand 1 - interleaved
+-                        dfb_in1.reserve_back(in1_block_num_tiles);
++                        { DeviceZoneScopedSumN2("IN1_SLOT_WAIT"); dfb_in1.reserve_back(in1_block_num_tiles); }
+                         uint32_t in1_write_offset = 0;
+                         uint64_t in1_start_address =
+                             dfb_in1.get_write_ptr();  // copy start address of block, to be used for mcasting
+@@ -411,7 +411,7 @@ void kernel_main() {
+                         in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
+ 
+                         // Barrier! make sure the reads are done
+-                        noc.async_read_barrier();
++                        { DeviceZoneScopedSumN1("IN1_RD_BARRIER"); noc.async_read_barrier(); }
+ #endif  // IN1_DRAM_WIDTH_SHARDED / IN1_DRAM_HEIGHT_SHARDED / IN1_SHARDED
+ 
+ #ifndef SKIP_MCAST
+@@ -592,6 +592,8 @@ void kernel_main() {
+ #endif  // FUSE_BIAS
+ 
+ #ifndef OUT_SHARDED
++                    {
++                    DeviceZoneScopedN("WR_PASS");
+                     // WRITER
+                     uint32_t num_blocks_w_dim_ =
+                         bw >= last_num_blocks_w_dim - 1 ? last_num_blocks_w_dim : num_blocks_w_dim;
+@@ -657,6 +659,7 @@ void kernel_main() {
+                         dfb_out.wait_front(padded_block_tiles_h_skip);
+                         dfb_out.pop_front(padded_block_tiles_h_skip);
+                     }
++                    }
+ 
+ #endif
+                     in1_tensor_current_w_dim_block_tile_id += in1_tensor_next_w_dim_block_stride;
