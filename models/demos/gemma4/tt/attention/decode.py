@@ -13,6 +13,7 @@ from loguru import logger
 
 import ttnn
 
+from .. import pin_move_dummy
 from .operations import (
     _stage_fp,
     _stage_fp_full,
@@ -333,6 +334,11 @@ def decode_forward(
         max_cores_per_head_batch=int(os.environ.get("GEMMA4_SDPA_MAX_CORES", "16")),
     )
 
+    # Research knob, off by default: dummy L1 round trip around global SDPAs (pin_move_dummy.py).
+    pin_move = pin_move_dummy.enabled(config.head_dim)
+    if pin_move:
+        pin_move_dummy.move_out(mesh_device, batch_size)
+
     if page_table is not None:
         sdpa_num_local_kv_heads = 1 if weights.kv_replicated else config.num_key_value_heads // tp
         tt_sdpa = ttnn.transformer.paged_scaled_dot_product_attention_decode(
@@ -365,6 +371,8 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    if pin_move:
+        pin_move_dummy.move_back(mesh_device, batch_size)
     _log_sdpa_call(
         "PLAIN",
         is_causal=True,
