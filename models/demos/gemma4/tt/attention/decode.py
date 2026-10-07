@@ -13,7 +13,7 @@ from loguru import logger
 
 import ttnn
 
-from .. import pin_move_dummy
+from .. import lm_head_reload, pin_move_dummy
 from .operations import (
     _stage_fp,
     _stage_fp_full,
@@ -338,6 +338,12 @@ def decode_forward(
     pin_move = pin_move_dummy.enabled(config.head_dim)
     if pin_move:
         pin_move_dummy.move_out(mesh_device, batch_size)
+    # Research knob GEMMA4_LMHEAD_L1_RELOAD, off by default: free the pinned drafter head around a
+    # global SDPA whose CB stack reaches into it (lm_head_reload.py).
+    reload_bracket = None
+    if lm_head_reload.active() and config.head_dim >= 512:
+        reload_bracket = lm_head_reload.bracket(lm_head_reload.grid_cores(sdpa_grid.x, sdpa_grid.y), "global SDPA")
+        reload_bracket.__enter__()
 
     if page_table is not None:
         sdpa_num_local_kv_heads = 1 if weights.kv_replicated else config.num_key_value_heads // tp
@@ -371,6 +377,8 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    if reload_bracket is not None:
+        reload_bracket.__exit__(None, None, None)
     if pin_move:
         pin_move_dummy.move_back(mesh_device, batch_size)
     _log_sdpa_call(

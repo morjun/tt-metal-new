@@ -40,6 +40,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.demos.gemma4.tt import lm_head_reload
 from models.demos.gemma4.tt.activation_sharding import ActivationSharding
 from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbedder
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
@@ -407,6 +408,8 @@ class Gemma4AssistantModel:
             self.lm_head_l1_ring = (_wsh([T, in0_w]), _wsh([T, cols // cores]))
             logger.info(f"[lm_head-split] gather_in0 ring: in0 shard {in0_w // T} tile(s)/core on {cores} cores")
         self.lm_head_l1, self.lm_head_l1_pc, self.lm_head_l1_ckc = pinned, pc, ckc
+        # Research knob GEMMA4_LMHEAD_L1_RELOAD (off by default): see tt/lm_head_reload.py.
+        lm_head_reload.register(self, "lm_head_l1", mesh_device)
 
     def step(self, token_tt, target_hidden, shared_kv, page_tables, pos_uint32, pos_int32, return_logits=True):
         """One drafter step.
@@ -482,6 +485,7 @@ class Gemma4AssistantModel:
                     head = ttnn.sharded_to_interleaved(ring_out, ttnn.DRAM_MEMORY_CONFIG)
                     ring_out.deallocate(True)
                 else:
+                    lm_head_reload.reload()  # no-op unless GEMMA4_LMHEAD_L1_RELOAD
                     head = ttnn.linear(
                         normed,
                         self.lm_head_l1,

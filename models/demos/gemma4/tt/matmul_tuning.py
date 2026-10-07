@@ -478,6 +478,14 @@ def lm_head_out_block_w_config(env_name, x, w):
     T = ttnn.TILE_SIZE
     k, n = int(w.shape[-2]), int(w.shape[-1])
     per_core_n = -(-(-(-n // cores)) // T)
+    # Optional wider per_core_N (e.g. GEMMA4_LMHEAD_DRAFT_PCN for GEMMA4_LMHEAD_DRAFT_OBW): fewer cores
+    # carry the matmul, so a composite out_block_w becomes legal when the minimal per_core_N is
+    # prime (gemma4-12b MEASUREMENT_RECORD §5.5.14 Gate 2d). Unset = the minimal per_core_N.
+    pcn_raw = (os.getenv(env_name.replace("_OBW", "_PCN")) or "").strip()
+    if pcn_raw:
+        if int(pcn_raw) < per_core_n:
+            raise ValueError(f"{env_name.replace('_OBW', '_PCN')}={pcn_raw} < minimal per_core_N {per_core_n}")
+        per_core_n = int(pcn_raw)
     if per_core_n % out_block_w:
         raise ValueError(f"{env_name}={out_block_w} must divide per_core_N={per_core_n} (N={n}, {cores} cores)")
     pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(

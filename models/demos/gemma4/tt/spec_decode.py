@@ -31,7 +31,7 @@ import time
 import torch
 
 import ttnn
-from models.demos.gemma4.tt import pli_env
+from models.demos.gemma4.tt import lm_head_reload, pli_env
 from models.demos.gemma4.tt.assistant.masked_embedding import CmeLogits, _same_buffer
 from models.demos.gemma4.tt.assistant.model import SplitLogits
 
@@ -101,7 +101,10 @@ def argmax_last(assistant, logits, rows):
         # The alternative, argmax per part and pick the larger, needs each
         # part's max VALUE, and ttnn.max is slower than argmax itself (§2.10).
         rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
-        joined = ttnn.concat(rm, dim=-1)
+        # Research knob GEMMA4_LMHEAD_L1_RELOAD: this concat's CB on core (0,0) holds the whole row
+        # (CB end 635,776) and reaches into a pin of >= 52,800 cols; free the head around it.
+        with lm_head_reload.bracket([(0, 0)], "split-logits concat"):
+            joined = ttnn.concat(rm, dim=-1)
         for t in rm:
             t.deallocate(True)
         idx = ttnn.argmax(joined, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
