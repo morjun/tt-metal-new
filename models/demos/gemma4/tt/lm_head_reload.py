@@ -6,21 +6,24 @@ Off unless GEMMA4_LMHEAD_L1_RELOAD=1 (gemma4-12b MEASUREMENT_RECORD §5.5.14, Ga
 
 The pinned slice (GEMMA4_LMHEAD_L1_COLS) starts at S. Some ops' program-local CBs reach above S
 (the global SDPAs up to 801,024; the split-logits concat on core (0,0)). Around each such op:
-1. `bracket(cores)` frees the head before the op. This is host-side bookkeeping only; L1 is not
+1. `bracket(tag)` frees the head before the op. This is host-side bookkeeping only; L1 is not
    touched, and the op's CBs pass the host-side CB clash check.
-2. After the op, it re-allocates the head at the same address (asserted) and marks the op's cores
-   dirty.
+2. After the op, it re-allocates the head at the same address (asserted) and marks dirty the cores
+   whose CBs, as allocated by the op's program, end above S (read once per input signature from a
+   ttnn graph capture of an eager call, then cached; see `bracket`).
 3. Before the drafter lm_head, `reload()` copies `[S, ceiling)` (whole 2,048 B pages) back from a
    DRAM snapshot taken once at pin time, on the dirty cores only.
 
 The head stays one tensor, so it is still a single slice matmul. Verified standalone and under trace
 in research_codes/mm_profiling/test_pin_free_realloc_trace.py (Gate 4).
 
-GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024) is the highest CB end any bracketed op can reach:
-the captured global-SDPA ceiling. Everything from S up to it is reloaded.
+GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024, the captured global-SDPA ceiling) bounds the snapshot
+and the reload: everything from S up to it is reloaded. Every bracket asserts that its op's highest
+CB end, read from the op's program, does not exceed it.
 """
 
 import os
+import re
 
 from loguru import logger
 
@@ -81,6 +84,7 @@ def register(owner, attr, device):
     st.S, st.cores, st.index = s_addr, cores, {c: i for i, c in enumerate(cores)}
     st.pages = -(-(CEILING - s_addr) // PAGE)
     st.dirty = set()
+    st.footprints = {}  # bracket key -> (dirty cores, highest CB end); see bracket
     # Reload core sets are snapped to two fixed sets so the trace sees a fixed set of programs: the
     # drafter global SDPA's 8x4 block (it also covers the split-logits concat on (0,0)), else all cores.
     st.small = [c for c in cores if c[0] < 8 and c[1] < 4]
@@ -103,19 +107,76 @@ def register(owner, attr, device):
     )
 
 
-class bracket:
-    """Free the head around an op whose CBs reach above S on `cores`, then re-allocate it."""
+_CORE_RANGE = re.compile(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]")  # "[x1-y1 - x2-y2]", x first
 
-    def __init__(self, cores, tag):
-        self.cores, self.tag = cores, tag
+
+def _cb_reach(graph, s_addr):
+    """From a ttnn graph capture: the cores whose program-local CBs end above `s_addr`, and the highest CB end."""
+    dirty, top = set(), 0
+    for node in graph:
+        p = node.get("params", {})
+        if node.get("node_type") != "circular_buffer_allocate" or p.get("globally_allocated") != "0":
+            continue
+        end = int(p["address"]) + int(p["size"])
+        if end <= s_addr:
+            continue
+        top = max(top, end)
+        for x1, y1, x2, y2 in _CORE_RANGE.findall(p.get("core_range_set", "")):
+            dirty.update((x, y) for y in range(int(y1), int(y2) + 1) for x in range(int(x1), int(x2) + 1))
+    return dirty, top
+
+
+class bracket:
+    """Free the head around one op whose CBs may reach into it, then re-allocate it at the same address.
+
+    The op's CB footprint is read from its own program, not passed in. On the first call for a given
+    `key_tensors` signature (shapes + memory configs, a proxy for "same program"), the op runs inside a
+    ttnn graph capture (nesting is supported: GraphTracker keeps a processor stack). From the circular
+    buffers the program allocated, the bracket takes the cores whose CBs end above S, which it marks
+    dirty, and the highest CB end, which must not exceed the reload ceiling or bytes would be overwritten
+    that reload() never restores. The footprint is cached per signature.
+
+    Graph capture cannot run inside a trace capture: it serialises op arguments, and printing a tensor
+    list reads device data, which fails with "Reads are not supported during trace capture". So every
+    signature must be seen once eagerly first. ttnn imposes the same rule on programs ("Cannot load new
+    binaries during trace capture"), and the demo's compile run meets both. A signature first seen
+    inside a capture fails loudly; it is never silently wrong. `tag` only names the op in logs, errors
+    and the cache key.
+    """
+
+    def __init__(self, tag, *key_tensors):
+        self.tag = tag
+        self.key = (tag,) + tuple((tuple(t.shape), str(t.memory_config())) for t in key_tensors)
+        self.capture = False
 
     def __enter__(self):
-        if _st is not None:
-            getattr(_st.owner, _st.attr).deallocate(True)
+        if _st is None:
+            return self
+        getattr(_st.owner, _st.attr).deallocate(True)
+        if self.key not in _st.footprints:
+            self.capture = True
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, *exc):
         if _st is None:
+            return False
+        if self.capture:
+            graph = ttnn.graph.end_graph_capture()
+            if exc_type is not None:
+                return False
+            dirty, top = _cb_reach(graph, _st.S)
+            if top > CEILING:
+                raise RuntimeError(
+                    f"[lm-head-reload] {self.tag}: CBs reach {top} > reload ceiling {CEILING} "
+                    f"(GEMMA4_LMHEAD_L1_RELOAD_CEIL); the reload would leave [{CEILING}, {top}) overwritten"
+                )
+            _st.footprints[self.key] = (frozenset(c for c in dirty if c in _st.index), top)
+            logger.info(
+                f"[lm-head-reload] bracket '{self.tag}': CBs reach into the head on {len(dirty)} cores, "
+                f"highest CB end {top} (learned from the program; cached for this input signature)"
+            )
+        elif exc_type is not None:
             return False
         h = ttnn.allocate_tensor_on_device(_st.shape, _st.dtype, _st.layout, _st.device, _st.mc)
         if h.buffer_address() != _st.S:
@@ -124,12 +185,8 @@ class bracket:
                 "something allocated L1 inside the bracket"
             )
         setattr(_st.owner, _st.attr, h)
-        _st.dirty.update(c for c in self.cores if c in _st.index)
+        _st.dirty.update(_st.footprints[self.key][0])
         return False
-
-
-def grid_cores(gx, gy):
-    return [(x, y) for y in range(gy) for x in range(gx)]
 
 
 def reload():

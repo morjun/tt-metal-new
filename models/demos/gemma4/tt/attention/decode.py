@@ -342,7 +342,7 @@ def decode_forward(
     # global SDPA whose CB stack reaches into it (lm_head_reload.py).
     reload_bracket = None
     if lm_head_reload.active() and config.head_dim >= 512:
-        reload_bracket = lm_head_reload.bracket(lm_head_reload.grid_cores(sdpa_grid.x, sdpa_grid.y), "global SDPA")
+        reload_bracket = lm_head_reload.bracket("global SDPA", tt_q, k_cache)
         reload_bracket.__enter__()
 
     if page_table is not None:
