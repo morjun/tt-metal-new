@@ -3,6 +3,8 @@
 
 Arms (tuned matmuls, fused traced route, 500 tokens, fresh process per cell; protocol of
 run_lmhead_obw_e2e.py):
+  A  no pin, lm_head auto out_block_w                                      (§5.5.13 arm A)
+  B  no pin, drafter head out_block_w 5, target 3                          (§5.5.13 arm B)
   D  38,720 pinned cols, tail out_block_w 8, target 3                        (§5.5.13 arm D)
   R  52,800 pinned cols + GEMMA4_LMHEAD_L1_RELOAD, tail per_core_N 60 / out_block_w 4, target 3
      (the head is freed around each global SDPA and the split-logits concat, and reloaded from
@@ -12,7 +14,7 @@ Gates (abort): exit code, 500 tokens, fused-traced route; R must log the reload 
 S=589,824 and both reload core counts; the tail must log per_core_N 60 / out_block_w 4 in R.
 Every cell must produce the same text, acceptance and iteration count.
 
-    python research_codes/mm_profiling/run_pin_reload_e2e.py --rounds 6 [--arms R --rounds 1]
+    python research_codes/mm_profiling/run_pin_reload_e2e.py --rounds 6 [--arms R --rounds 1] [--arms ABDR]
 """
 
 import argparse
@@ -24,9 +26,12 @@ import sys
 from pathlib import Path
 
 from run_lmhead_e2e import REPO, parse, setup_overlay
+from run_lmhead_obw_e2e import ARMS as ARMS_OBW
 from run_lmhead_obw_e2e import env_for
 
 ARMS = {
+    "A": {},
+    "B": {},
     "D": {},
     "R": {
         "GEMMA4_LMHEAD_L1_COLS": "52800",
@@ -52,7 +57,7 @@ def main():
     results = []
     for index, arm in enumerate(order):
         name = f"{index:02d}_{arm}"
-        env = env_for("D")
+        env = env_for(arm if arm in ARMS_OBW else "D")
         env.update(ARMS[arm])
         cmd = [
             sys.executable,
@@ -117,13 +122,11 @@ def main():
     )
     med = {a: statistics.median([r["ms_per_iteration"] for r in results if r["arm"] == a]) for a in arms}
     print("median ms/iteration:", med, flush=True)
-    if set(arms) == {"D", "R"}:
-        n = len(arms)
-        paired = []
-        for r in range(len(order) // n):
-            cell = {x["arm"]: x["ms_per_iteration"] for x in results[r * n : (r + 1) * n]}
-            paired.append(round((cell["R"] - cell["D"]) * 1000, 1))
-        print(f"R - D per round {paired} us, median {statistics.median(paired):+.1f} us/iter", flush=True)
+    n = len(arms)
+    rounds = [{x["arm"]: x["ms_per_iteration"] for x in results[r * n : (r + 1) * n]} for r in range(len(order) // n)]
+    for a, b in [(x, y) for i, y in enumerate(arms) for x in arms[i + 1 :]]:
+        paired = [round((cell[a] - cell[b]) * 1000, 1) for cell in rounds]
+        print(f"{a} - {b} per round {paired} us, median {statistics.median(paired):+.1f} us/iter", flush=True)
 
 
 if __name__ == "__main__":
