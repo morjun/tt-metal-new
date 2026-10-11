@@ -17,6 +17,9 @@ The pinned slice (GEMMA4_LMHEAD_L1_COLS) starts at S. Some ops' program-local CB
 The head stays one tensor, so it is still a single slice matmul. Verified standalone and under trace
 in research_codes/mm_profiling/test_pin_free_realloc_trace.py (Gate 4).
 
+GEMMA4_LMHEAD_L1_RELOAD_ROPE=1 also brackets the global layer's batch-1 rotary embedding (CBs to 512,896 on
+one core), which a pin of 59,840 cols or more (S <= 458,752) reaches; off by default.
+
 GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024, the captured global-SDPA ceiling) bounds the snapshot
 and the reload: everything from S up to it is reloaded. Every bracket asserts that its op's highest
 CB end, read from the op's program, does not exceed it.
@@ -31,6 +34,7 @@ import ttnn
 
 ENABLED = os.getenv("GEMMA4_LMHEAD_L1_RELOAD", "0") == "1"
 CEILING = int(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_CEIL", "801024"))
+ROPE = os.getenv("GEMMA4_LMHEAD_L1_RELOAD_ROPE", "0") == "1"
 PAGE = 2048
 KDIR = "research_codes/mm_profiling/kernels/"
 

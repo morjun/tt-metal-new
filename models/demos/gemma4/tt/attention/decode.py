@@ -156,9 +156,11 @@ def decode_forward(
             cos_b = ttnn.transpose(cos_pos, 1, 2)[:, :batch, :, :]  # [1, batch, 1, head_dim]
             sin_b = ttnn.transpose(sin_pos, 1, 2)[:, :batch, :, :]
 
+        rope_tag = "global rope" if lm_head_reload.active() and lm_head_reload.ROPE and config.head_dim >= 512 else None
+
         def _rope(t):
             if batch == 1:
-                return apply_rope(t, cos_pos, sin_pos, token_index=0)
+                return apply_rope(t, cos_pos, sin_pos, token_index=0, reload_bracket_tag=rope_tag)
             return apply_rope_decode_peruser(t, cos_b, sin_b)
 
         # Rotate Q (and K, unless this is a KV-shared layer) with the shared

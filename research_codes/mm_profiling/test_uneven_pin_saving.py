@@ -67,6 +67,16 @@ ARMS += [
     arm("uneven_k5_46080_pcn64", [(0, 38_720, 110), (38_720, 46_080, 46)], 64, [4, 8, 16]),
 ]
 
+# Optional: replace the arm table by the baseline + uniform pins given as
+# UNEVEN_EXTRA="cols:pcn:w,w;cols:pcn:w" (e.g. "59840:58:2,29;59840:60:4,6"); output goes to
+# UNEVEN_OUT (default pin_size_saving/uneven_extra.json) so the recorded Gate 2d data is kept.
+EXTRA = os.getenv("UNEVEN_EXTRA", "").strip()
+if EXTRA:
+    ARMS = [ARMS[0]]
+    for spec in EXTRA.split(";"):
+        cols, pcn, widths = spec.split(":")
+        ARMS.append(arm(f"u{cols}_pcn{pcn}", [(0, int(cols), 110)], int(pcn), [int(w) for w in widths.split(",")]))
+
 
 def crs(cores):
     return ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in cores])
@@ -179,7 +189,8 @@ def test_uneven_pin_saving(mesh_device, reset_seeds):
                     f"slices@{row['slice_addrs']}"
                 )
             rows.append(row)
-    out = Path(__file__).resolve().parents[2] / "generated/lmhead_l1_profile/pin_size_saving/uneven.json"
+    name = os.getenv("UNEVEN_OUT", "uneven_extra.json") if EXTRA else "uneven.json"
+    out = Path(__file__).resolve().parents[2] / "generated/lmhead_l1_profile/pin_size_saving" / name
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"base_us": base, "rows": rows, "rounds": ROUNDS}, indent=1) + "\n")
     logger.info(f"[uneven] wrote {out}")

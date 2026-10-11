@@ -15,7 +15,7 @@ lm_head (the drafter SDPA's 8x4), never the 110 of the demo's first step.
 Gates (abort): exit code; the knob log lines (tail / whole-head width, reload registration at S=589,824,
 reloads on 32 cores only).
 
-    python research_codes/mm_profiling/run_pin_reload_standalone.py --rounds 3
+    python research_codes/mm_profiling/run_pin_reload_standalone.py --rounds 3 [--arms A,D,R,R56320_60_4]
 """
 
 import argparse
@@ -46,6 +46,26 @@ ARMS = {
 WIDTH = {"A": set(), "B": {("262144", "75", "5")}, "D": {("223424", "64", "8")}, "R": {("209344", "60", "4")}}
 
 
+def arm_spec(arm):
+    """A fixed arm, or R<cols>_<tail per_core_N>_<tail out_block_w>[_rope] (pin + reload at another size;
+    _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE)."""
+    if arm in ARMS:
+        return ARMS[arm][0], ARMS[arm][1], WIDTH[arm]
+    m = re.fullmatch(r"R(\d+)_(\d+)_(\d+)(_rope)?", arm)
+    if not m:
+        raise SystemExit(f"unknown arm {arm}")
+    cols, pcn, obw, rope = m.groups()
+    extra = {
+        "GEMMA4_LMHEAD_L1_COLS": cols,
+        "GEMMA4_LMHEAD_L1_RELOAD": "1",
+        "GEMMA4_LMHEAD_DRAFT_OBW": obw,
+        "GEMMA4_LMHEAD_DRAFT_PCN": pcn,
+    }
+    if rope:
+        extra["GEMMA4_LMHEAD_L1_RELOAD_ROPE"] = "1"
+    return "D", extra, {(str(262144 - int(cols)), pcn, obw)}
+
+
 def parse(log):
     # the K-sweep row "  3  <fused ms/iter> <ms/step> <tok/s/u> <control ms/iter> <ms/step> <speedup>x"
     fused = re.search(r"(?:^|- )\s*3\s+([\d.]+)\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+x", log, re.M)
@@ -65,19 +85,19 @@ def parse(log):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rounds", type=int, default=3)
-    p.add_argument("--arms", default="ABDR")
+    p.add_argument("--arms", default="A,B,D,R", help="comma-separated; R<cols>_<pcn>_<obw> for other pin sizes")
     p.add_argument("--output", type=Path, default=REPO / "generated/lmhead_l1_profile/standalone_pin_reload")
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     setup_overlay()
-    arms = list(args.arms)
+    arms = args.arms.split(",")
     order = []
     for r in range(args.rounds):
         order += arms if r % 2 == 0 else arms[::-1]
     results = []
     for index, arm in enumerate(order):
         name = f"{index:02d}_{arm}"
-        base, extra = ARMS[arm]
+        base, extra, expected_width = arm_spec(arm)
         env = env_for(base)
         env.update(extra)
         env["GEMMA4_DRAFT_K_SWEEP"] = "3"
@@ -110,9 +130,9 @@ def main():
         results.append(row)
         (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         print(row, flush=True)
-        if proc.returncode != 0 or row["total"] is None or width != WIDTH[arm]:
+        if proc.returncode != 0 or row["total"] is None or width != expected_width:
             raise SystemExit(f"cell {name} failed its exit/width gate: width={width}")
-        if arm == "R" and (reg[:1] != ["589824"] or reloads != [32]):
+        if arm.startswith("R") and (not reg or reloads != [32] or (arm == "R" and reg[:1] != ["589824"])):
             raise SystemExit(f"cell {name}: reload gate failed: S={reg} reloads={reloads}")
     for key in ("fused_ms_per_iter", "backbone", "head", "argmax", "total"):
         med = {a: statistics.median([r[key] for r in results if r["arm"] == a]) for a in arms}
