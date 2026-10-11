@@ -18,8 +18,8 @@ valid data and are excluded, as LOCKSTEP-only reservations are in lm_head_l1_ten
 copied-back range is its output and counts. The manifest records the stale bytes per core separately.
 
 The stale state at the start of the captured iteration is taken from its end (steady state: the previous
-iteration's target window overwrote the same cores). Drafter step 0 only: head_and_other, layer_00 and the
-global-SDPA CB ceiling (plus any other bracketed op, e.g. the rotary embedding under
+iteration's target window overwrote the same cores). Drafter step 0 only: head_and_other, layer_00, layer_03 (the global
+layer) and the global-SDPA CB ceiling (plus any other bracketed op, e.g. the rotary embedding under
 GEMMA4_LMHEAD_L1_RELOAD_ROPE). Works on the demo capture and on the standalone drafter capture
 (test_lm_head_l1_address_capture, 72 matmuls).
 
@@ -269,8 +269,8 @@ def select(ops, total):
             ident = call_identity(op["matmul"], total)
             if ident["model"] != "draft" or ident["draft_step"] != 0:
                 continue
-            if ident["layer"] == 0:
-                chosen.append(("layer_00", ident["role"], op))
+            if ident["layer"] in (0, 3):  # layer 3 is the global layer: its ops after the SDPA see the stale 8x4
+                chosen.append((f'layer_{ident["layer"]:02d}', ident["role"], op))
             elif ident["layer"] is None:
                 chosen.append(("head_and_other", ident["role"], op))
         elif name == "GenericOpDeviceOperation":
