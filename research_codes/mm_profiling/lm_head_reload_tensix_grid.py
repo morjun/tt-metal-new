@@ -19,7 +19,9 @@ copied-back range is its output and counts. The manifest records the stale bytes
 
 The stale state at the start of the captured iteration is taken from its end (steady state: the previous
 iteration's target window overwrote the same cores). Drafter step 0 only: head_and_other, layer_00 and the
-global-SDPA CB ceiling.
+global-SDPA CB ceiling (plus any other bracketed op, e.g. the rotary embedding under
+GEMMA4_LMHEAD_L1_RELOAD_ROPE). Works on the demo capture and on the standalone drafter capture
+(test_lm_head_l1_address_capture, 72 matmuls).
 
     python research_codes/mm_profiling/lm_head_reload_tensix_grid.py generated/lmhead_l1_profile/demo_reload_52800
 """
@@ -161,7 +163,7 @@ def core_layers(op, core, head, top):
     }
 
 
-def render(op, title, base, top, head, destination, pdf):
+def render(op, title, base, top, head, cols, destination, pdf):
     destination.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(13, 12.3))
     fig.subplots_adjust(left=0.065, right=0.93, top=0.87, bottom=0.1)
@@ -224,7 +226,7 @@ def render(op, title, base, top, head, destination, pdf):
     fig.text(
         0.5,
         0.928,
-        f"Pinned head 52,800 cols at S = {head:,}, {state}.\n"
+        f"Pinned head {cols:,} cols at S = {head:,}, {state}.\n"
         f"Each square: bottom = address 0, top = {top:,} B. "
         f"Utilization = CB + tensor data + intact head / {top - base:,} allocatable B; stale head bytes excluded.",
         ha="center",
@@ -273,6 +275,8 @@ def select(ops, total):
                 chosen.append(("head_and_other", ident["role"], op))
         elif name == "GenericOpDeviceOperation":
             chosen.append(("head_and_other", f'dram_reload_{len(op["reload_cores"])}cores', op))
+        elif name == "RotaryEmbeddingDeviceOperation" and not op["head_allocated"]:
+            chosen.append(("cb_ceiling", f"global_rope_layer{(op['matmul'] - 1) // 5:02d}", op))
         elif name == "ConcatDeviceOperation" and not op["head_allocated"]:
             chosen.append(("head_and_other", "split_logits_concat", op))
         elif name == "SdpaDecodeDeviceOperation":
@@ -308,7 +312,7 @@ def main():
         for group, role, op in select(ops, total):
             title = f'Drafter · step 0 · {group.replace("_", " ")} · {role} · graph op {op["start"]:05d}'
             stem = out / "draft" / group / f'{role}_{op["start"]:05d}'
-            summary = render(op, title, base, top, head, stem, pdf)
+            summary = render(op, title, base, top, head, report["cols"], stem, pdf)
             entries.append(
                 {
                     "index": op["start"],
