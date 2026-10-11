@@ -12,8 +12,10 @@ through the iteration, per core:
 - **light green**: head range overwritten by an earlier op and not yet reloaded (stale until the reload);
 - **hatched**: at a reload op, the range it copies back from the DRAM snapshot on its cores.
 
-Utilization = union(program-local CBs, physical L1 tensor pages, the head range [S, top)) / allocatable L1:
-the head range counts whether the tensor is allocated or freed-but-preserved.
+Utilization = union(program-local CBs, physical L1 tensor pages, intact head bytes) / allocatable L1. Intact
+head bytes count whether the tensor is allocated or freed-but-preserved. Stale head bytes (light green) hold no
+valid data and are excluded, as LOCKSTEP-only reservations are in lm_head_l1_tensix_grid.py; a reload op's
+copied-back range is its output and counts. The manifest records the stale bytes per core separately.
 
 The stale state at the start of the captured iteration is taken from its end (steady state: the previous
 iteration's target window overwrote the same cores). Drafter step 0 only: head_and_other, layer_00 and the
@@ -146,7 +148,7 @@ def core_layers(op, core, head, top):
     stale = subtract((head, stale_end), now) if stale_end else []
     intact = subtract(h, now + stale)
     reload = [op["reload_range"]] if core in map(tuple, op.get("reload_cores", [])) else []
-    used = intervals_union(cbs + tensors + [h])
+    used = intervals_union(cbs + tensors + intact + reload)
     return {
         "cbs": [(a, min(b, head)) for a, b in cbs if a < head],
         "tensors": tensors,
@@ -155,6 +157,7 @@ def core_layers(op, core, head, top):
         "intact": intact,
         "reload": reload,
         "used_bytes": sum(b - a for a, b in used),
+        "stale_bytes": sum(b - a for a, b in subtract((head, stale_end), now + reload)) if stale_end else 0,
     }
 
 
@@ -200,6 +203,7 @@ def render(op, title, base, top, head, destination, pdf):
         )
         summary[f"{x},{y}"] = {
             "used_bytes": L["used_bytes"],
+            "stale_bytes_excluded": L["stale_bytes"],
             "used_percent": round(pct, 3),
             "head_overwritten_now": L["now"],
             "head_stale": L["stale"],
@@ -222,7 +226,7 @@ def render(op, title, base, top, head, destination, pdf):
         0.928,
         f"Pinned head 52,800 cols at S = {head:,}, {state}.\n"
         f"Each square: bottom = address 0, top = {top:,} B. "
-        f"Utilization = CB + tensor data + head range [S, top) / {top - base:,} allocatable B.",
+        f"Utilization = CB + tensor data + intact head / {top - base:,} allocatable B; stale head bytes excluded.",
         ha="center",
         fontsize=9,
     )
@@ -233,7 +237,7 @@ def render(op, title, base, top, head, destination, pdf):
             Patch(facecolor=COLORS["tensor"], label="L1 tensor (top-down)"),
             Patch(facecolor=COLORS["head"], label="pinned head, weights intact (allocated or freed)"),
             Patch(facecolor=OVERWRITE, label="head range under this op's CBs (overwritten now)"),
-            Patch(facecolor=STALE, label="head range overwritten earlier, awaiting reload"),
+            Patch(facecolor=STALE, label="head range overwritten earlier, awaiting reload (not counted)"),
             Patch(facecolor="white", edgecolor="#1b5e20", hatch="xxxx", label="copied back from DRAM by this reload"),
             Patch(facecolor="white", edgecolor="#777777", label="free"),
         ],
@@ -325,7 +329,7 @@ def main():
         "top": top,
         "head_addr": head,
         "reload_ceiling": args.ceiling,
-        "utilization": "union(program-local CBs, physical L1 tensor pages, head range [S, top)) / allocatable L1",
+        "utilization": "union(program-local CBs, physical L1 tensor pages, intact head bytes, a reload's copied-back range) / allocatable L1; stale head bytes excluded (stale_bytes_excluded per core)",
         "stale_at_entry_cores": len(stale_end),
         "representative_plots": len(entries),
         "entries": entries,
