@@ -47,14 +47,16 @@ WIDTH = {"A": set(), "B": {("262144", "75", "5")}, "D": {("223424", "64", "8")},
 
 
 def arm_spec(arm):
-    """A fixed arm, or R<cols>_<tail per_core_N>_<tail out_block_w>[_rope] (pin + reload at another size;
-    _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE)."""
+    """A fixed arm, or R<cols>_<tail per_core_N>_<tail out_block_w>[_rope][_drisc[<GB/s>][c<pages>]] (pin + reload
+    at another size; _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE; _drisc
+    pushes the reload from the DRAM cores during the window, GEMMA4_LMHEAD_L1_RELOAD_DRISC, optionally paced to
+    <GB/s> (…_DRISC_GBPS) with <pages>-page DMA chunks (…_DRISC_CHUNK))."""
     if arm in ARMS:
         return ARMS[arm][0], ARMS[arm][1], WIDTH[arm]
-    m = re.fullmatch(r"R(\d+)_(\d+)_(\d+)(_rope)?", arm)
+    m = re.fullmatch(r"R(\d+)_(\d+)_(\d+)(_rope)?(_drisc(\d+)?(?:c(\d+))?)?", arm)
     if not m:
         raise SystemExit(f"unknown arm {arm}")
-    cols, pcn, obw, rope = m.groups()
+    cols, pcn, obw, rope, drisc, gbps, chunk = m.groups()
     extra = {
         "GEMMA4_LMHEAD_L1_COLS": cols,
         "GEMMA4_LMHEAD_L1_RELOAD": "1",
@@ -63,6 +65,12 @@ def arm_spec(arm):
     }
     if rope:
         extra["GEMMA4_LMHEAD_L1_RELOAD_ROPE"] = "1"
+    if drisc:
+        extra["GEMMA4_LMHEAD_L1_RELOAD_DRISC"] = "1"
+    if gbps:
+        extra["GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS"] = gbps
+    if chunk:
+        extra["GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK"] = chunk
     return "D", extra, {(str(262144 - int(cols)), pcn, obw)}
 
 
@@ -116,6 +124,10 @@ def main():
         (args.output / f"{name}.log").write_text(proc.stdout)
         reg = re.findall(r"\[lm-head-reload\] head at S=(\d+)", proc.stdout)
         reloads = sorted({int(n) for n in re.findall(r"\[lm-head-reload\] reload on (\d+) dirty cores", proc.stdout)})
+        drisc_reloads = sorted(
+            {int(n) for n in re.findall(r"\[lm-head-reload\] DRISC reload on (\d+) dirty cores", proc.stdout)}
+        )
+        push = re.search(r"DRISC last push: slowest DRISC \d+ ticks \(([\d.]+) us\)", proc.stdout)
         width = set(re.findall(r"GEMMA4_LMHEAD_DRAFT_OBW: N=(\d+) per_core_N=(\d+) out_block_w=(\d+)", proc.stdout))
         row = {
             "index": index,
@@ -124,6 +136,8 @@ def main():
             "log": f"{name}.log",
             "reload_S": reg,
             "reload_core_counts": reloads,
+            "drisc_reload_core_counts": drisc_reloads,
+            "drisc_last_push_us": float(push.group(1)) if push else None,
             "width": sorted(width),
             **parse(proc.stdout),
         }
@@ -132,8 +146,11 @@ def main():
         print(row, flush=True)
         if proc.returncode != 0 or row["total"] is None or width != expected_width:
             raise SystemExit(f"cell {name} failed its exit/width gate: width={width}")
-        if arm.startswith("R") and (not reg or reloads != [32] or (arm == "R" and reg[:1] != ["589824"])):
-            raise SystemExit(f"cell {name}: reload gate failed: S={reg} reloads={reloads}")
+        want = ([], [32]) if "_drisc" in arm else ([32], [])  # (Tensix reloads, DRISC reloads)
+        if arm.startswith("R") and (
+            not reg or (reloads, drisc_reloads) != want or (arm == "R" and reg[:1] != ["589824"])
+        ):
+            raise SystemExit(f"cell {name}: reload gate failed: S={reg} reloads={reloads} drisc={drisc_reloads}")
     for key in ("fused_ms_per_iter", "backbone", "head", "argmax", "total"):
         med = {a: statistics.median([r[key] for r in results if r["arm"] == a]) for a in arms}
         print(f"median {key}:", med, flush=True)

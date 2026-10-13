@@ -44,6 +44,7 @@ Usage:
     pytest models/demos/gemma4/tests/unit/test_assistant_standalone_l1.py -s -k 1x2
 """
 
+import hashlib
 import math
 import os
 import re
@@ -446,6 +447,11 @@ def _time_fused_k_steps(mesh_device, rig, k, reps=TRACE_REPS, mode="full"):
         ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
     ttnn.synchronize_device(mesh_device)
     ms = (time.perf_counter() - t0) / reps * 1e3
+    if mode == "full":
+        # Output fingerprint after the replays, so arms that should be bit-identical can be compared.
+        h_bytes = ttnn.to_torch(ttnn.get_device_tensors(h)[0]).float().numpy().tobytes()
+        tok = ttnn.to_torch(ttnn.get_device_tensors(idx)[0]).flatten()[:1].tolist()
+        logger.info(f"[fused-k] K={k} output: token={tok} hidden_sha256={hashlib.sha256(h_bytes).hexdigest()[:16]}")
 
     ttnn.release_trace(mesh_device, tid)
     if idx is not None:

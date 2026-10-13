@@ -20,6 +20,16 @@ in research_codes/mm_profiling/test_pin_free_realloc_trace.py (Gate 4).
 GEMMA4_LMHEAD_L1_RELOAD_ROPE=1 also brackets the global layer's batch-1 rotary embedding (CBs to 512,896 on
 one core), which a pin of 59,840 cols or more (S <= 458,752) reaches; off by default.
 
+GEMMA4_LMHEAD_L1_RELOAD_DRISC=1 moves the reload off the command queue (hidden reload, off by default): a
+resident kernel on the DRAM cores' RISC-Vs (kernels/drisc_reload_resident.cpp), launched once at
+registration outside the command queue, pushes the snapshot into the dirty cores while the Tensix ops after
+the drafter's global SDPA run. A 1-core trigger op right after that SDPA starts it; a 1-core wait op in place
+of the reload op blocks until all DRISCs report done. Any bracket entered while a push is in flight waits for
+it first, since its op's CBs may overlap the bytes being written. The kernel is stopped before the device
+closes (`ttnn.close_mesh_device` is wrapped). GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS caps the push's aggregate rate
+(default 0 = unpaced), so it spreads over the window instead of crowding the first ops after the trigger;
+GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK sets the DRISC DMA chunk in 2 KB pages (default 16).
+
 GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024, the captured global-SDPA ceiling) bounds the snapshot
 and the reload: everything from S up to it is reloaded. Every bracket asserts that its op's highest
 CB end, read from the op's program, does not exceed it.
@@ -35,6 +45,14 @@ import ttnn
 ENABLED = os.getenv("GEMMA4_LMHEAD_L1_RELOAD", "0") == "1"
 CEILING = int(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_CEIL", "801024"))
 ROPE = os.getenv("GEMMA4_LMHEAD_L1_RELOAD_ROPE", "0") == "1"
+DRISC = os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC", "0") == "1"
+GO_STREAM = 15  # DRISC stream whose counter the trigger raises (16 DRISC streams)
+CMD_SMALL, CMD_ALL, CMD_QUIT = 1, 2, 3
+# Paced push (off by default): aggregate rate cap over all DRISCs, GB/s (0 = unpaced), and DMA chunk in pages.
+DRISC_GBPS = float(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS", "0"))
+DRISC_CHUNK = int(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK", "16"))
+AICLK_HZ = 1.35e9  # DRISC wall-clock ticks per second (the device profiler converts its timestamps at AICLK)
+WAIT_TIMEOUT = 1_000_000  # waiter polls (two NoC round trips each) before it gives up instead of hanging the device
 PAGE = 2048
 KDIR = "research_codes/mm_profiling/kernels/"
 
@@ -88,6 +106,7 @@ def register(owner, attr, device):
     st.S, st.cores, st.index = s_addr, cores, {c: i for i, c in enumerate(cores)}
     st.pages = -(-(CEILING - s_addr) // PAGE)
     st.dirty = set()
+    st.in_drafter = False
     st.footprints = {}  # bracket key -> (dirty cores, highest CB end); see bracket
     # Reload core sets are snapped to two fixed sets so the trace sees a fixed set of programs: the
     # drafter global SDPA's 8x4 block (it also covers the split-logits concat on (0,0)), else all cores.
@@ -105,10 +124,137 @@ def register(owner, attr, device):
     # (a program first seen during capture is fatal). Reloading from the snapshot is idempotent.
     for reload_set in (st.small, st.cores):
         ttnn.generic_op([st.snap, head], _page_program("dram_reload_pages.cpp", st.snap, reload_set, s_addr))
+    st.inflight = None
+    if DRISC:
+        _drisc_start(st, head)
     logger.info(
         f"[lm-head-reload] head at S={s_addr} on {len(cores)} cores; reloads [S, {CEILING}) = {st.pages} pages "
         f"({st.pages * PAGE} B/core) from a {len(cores) * st.pages * PAGE} B DRAM snapshot"
     )
+
+
+def _one_core_program(kernel, core, compile_args, runtime_args, noc, cbs=()):
+    rt = ttnn.RuntimeArgs()
+    rt[core[0]][core[1]] = runtime_args
+    k = ttnn.KernelDescriptor(
+        kernel_source=KDIR + kernel,
+        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+        core_ranges=_crs([core]),
+        compile_time_args=compile_args,
+        runtime_args=rt,
+        config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_1, noc=noc),
+    )
+    return ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=list(cbs))
+
+
+def _drisc_trigger(cmd):
+    head = getattr(_st.owner, _st.attr)
+    prog = _one_core_program(
+        "drisc_reload_trigger.cpp",
+        _st.waiter,
+        [cmd, GO_STREAM, len(_st.drisc_xy)],
+        _st.drisc_xy,
+        ttnn.NOC.RISCV_0_default,  # NOC0: measured, one inline write over NOC1 adds 3 to a DRISC stream counter
+    )
+    ttnn.generic_op([head, head], prog)
+
+
+def _drisc_wait():
+    head = getattr(_st.owner, _st.attr)
+    scratch = ttnn.CBDescriptor(
+        total_size=32 * len(_st.drisc_xy),
+        core_ranges=_crs([_st.waiter]),
+        format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=32)],
+    )
+    prog = _one_core_program(
+        "drisc_reload_wait.cpp",
+        _st.waiter,
+        [len(_st.drisc_xy), GO_STREAM, _st.drisc_sync_addr, WAIT_TIMEOUT],
+        _st.drisc_xy,
+        ttnn.NOC.RISCV_0_default,  # NOC0 reaches the DRISCs' stream-mode NIU0: their L1 and registers
+        [scratch],
+    )
+    ttnn.generic_op([head, head], prog)
+    _st.inflight = None
+
+
+def _drisc_start(st, head):
+    """Launch the resident DRISC reload kernel on every DRISC sender and warm up its trigger / wait ops."""
+    ex = ttnn._ttnn.operations.experimental
+    dev = st.device
+    senders = ex.drisc_senders(dev)
+    base, size = ex.drisc_l1_unreserved(dev)
+    chunk = min(DRISC_CHUNK, size // (2 * PAGE))
+    banks = sorted({b for b, _, _ in senders})
+
+    def xy(c):
+        v = dev.worker_core_from_logical_core(ttnn.CoreCoord(*c))
+        return (v.x << 16) | v.y
+
+    st.waiter = st.cores[-1]  # the core that runs the trigger and wait ops
+    # Each bank's two DRISCs push that bank's pages of alternate cores of a set.
+    by_bank = {b: [s for s in senders if s[0] == b] for b in banks}
+    rts = {}
+    for b in banks:
+        for e, (_, logical, _) in enumerate(by_bank[b]):
+            lists = [
+                [c for k, c in enumerate(core_set) if k % len(by_bank[b]) == e] for core_set in (st.small, st.cores)
+            ]
+            rt = [st.snap.buffer_address(), len(banks), b, st.pages, st.S, base, len(lists[0]), len(lists[1])]
+            for lst in lists:
+                for c in lst:
+                    rt += [st.index[c], xy(c)]
+            rts[(logical.x, logical.y)] = rt
+    st.drisc_xy = [(v.x << 16) | v.y for _, _, v in senders]
+    cores = [ttnn.CoreCoord(*k) for k in rts]
+    st.drisc_cores, st.drisc_sync_addr = cores, base + 2 * chunk * PAGE  # (taken, done) after the DMA buffers
+    # Paced: each DRISC issues one page per `pace` ticks, so the 16 together stay under DRISC_GBPS.
+    pace = round(len(cores) * PAGE * AICLK_HZ / (DRISC_GBPS * 1e9)) if DRISC_GBPS > 0 else 0
+    st.drisc = ex.launch_resident_drisc_kernel(
+        dev,
+        KDIR + "drisc_reload_resident.cpp",
+        cores,
+        [PAGE, chunk, GO_STREAM, pace],
+        [rts[(c.x, c.y)] for c in cores],
+    )
+    # Build the trigger and wait programs now, outside any trace capture; reloading is idempotent.
+    for cmd in (CMD_ALL, CMD_SMALL):
+        _drisc_trigger(cmd)
+        _drisc_wait()
+    ttnn.synchronize_device(dev)
+
+    orig_close = ttnn.close_mesh_device
+
+    def close_mesh_device(mesh_device, *args, **kwargs):
+        drisc_stop()
+        return orig_close(mesh_device, *args, **kwargs)
+
+    ttnn.close_mesh_device = close_mesh_device
+    logger.info(
+        f"[lm-head-reload] DRISC reload resident on {len(cores)} DRAM cores ({len(banks)} banks, "
+        f"{chunk}-page DMA chunks, pace {pace} ticks/page ({DRISC_GBPS or 'unpaced'} GB/s cap), "
+        f"DRISC L1 [{base}, {base + size})), waiter core {st.waiter}"
+    )
+
+
+def drisc_stop():
+    """Stop the resident DRISC kernel (before the device closes). Idempotent."""
+    st = _st
+    if st is None or getattr(st, "drisc", None) is None:
+        return
+    if st.inflight is not None:
+        _drisc_wait()
+    ex = ttnn._ttnn.operations.experimental
+    ticks = [ex.read_drisc_l1(st.device, c, st.drisc_sync_addr, 3)[2] for c in st.drisc_cores]
+    logger.info(
+        f"[lm-head-reload] DRISC last push: slowest DRISC {max(ticks)} ticks ({max(ticks) / AICLK_HZ * 1e6:.1f} us), "
+        f"fastest {min(ticks)} ticks"
+    )
+    _drisc_trigger(CMD_QUIT)
+    ttnn.synchronize_device(st.device)
+    ttnn._ttnn.operations.experimental.wait_resident_drisc_kernel(st.drisc)
+    st.drisc = None
+    logger.info("[lm-head-reload] DRISC reload kernel stopped")
 
 
 _CORE_RANGE = re.compile(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]")  # "[x1-y1 - x2-y2]", x first
@@ -156,6 +302,10 @@ class bracket:
     def __enter__(self):
         if _st is None:
             return self
+        if _st.inflight is not None:
+            # The op's CBs may overlap bytes a DRISC is still writing: finish the push first.
+            _drisc_wait()
+            logger.warning(f"[lm-head-reload] bracket '{self.tag}' entered during a DRISC reload; waited for it")
         getattr(_st.owner, _st.attr).deallocate(True)
         if self.key not in _st.footprints:
             self.capture = True
@@ -190,12 +340,34 @@ class bracket:
             )
         setattr(_st.owner, _st.attr, h)
         _st.dirty.update(_st.footprints[self.key][0])
+        if getattr(_st, "drisc", None) is not None and _st.in_drafter and self.tag == "global SDPA" and _st.dirty:
+            # The drafter's last head-overwriting op before its lm_head: start the push now.
+            _st.inflight = _st.small if _st.dirty <= set(_st.small) else _st.cores
+            _drisc_trigger(CMD_SMALL if _st.inflight is _st.small else CMD_ALL)
+            _st.dirty.clear()
         return False
+
+
+def drafter_step():
+    """Mark the start of a drafter step: its global SDPA is the last op before the lm_head that overwrites it."""
+    if _st is not None:
+        _st.in_drafter = True
 
 
 def reload():
     """Restore `[S, ceiling)` on every dirty core. Call right before the lm_head reads the head."""
-    if _st is None or not _st.dirty:
+    if _st is None:
+        return
+    _st.in_drafter = False
+    if _st.inflight is not None:
+        cores = _st.inflight
+        _drisc_wait()
+        if len(cores) not in _st.__dict__.setdefault("logged", set()):
+            _st.logged.add(len(cores))
+            logger.info(f"[lm-head-reload] DRISC reload on {len(cores)} dirty cores (waited)")
+        if not _st.dirty:
+            return
+    if not _st.dirty:
         return
     cores = _st.small if _st.dirty <= set(_st.small) else _st.cores
     head = getattr(_st.owner, _st.attr)

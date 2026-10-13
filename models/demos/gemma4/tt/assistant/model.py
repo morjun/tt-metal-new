@@ -441,6 +441,7 @@ class Gemma4AssistantModel:
         h = self.mm.linear(inp, self.pre_projection)
         inp.deallocate(True)
 
+        lm_head_reload.drafter_step()  # no-op unless GEMMA4_LMHEAD_L1_RELOAD
         for i, layer in enumerate(self.layers):
             lt = self.layer_types[i]
             pt = page_tables[lt] if isinstance(page_tables, dict) else page_tables
