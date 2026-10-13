@@ -17,6 +17,10 @@ from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric
 from models.demos.gemma4.tests.unit.test_assistant_standalone_l1 import _build_standalone, _make_fused_k_body
 
 REPLAYS = int(os.getenv("OPPROF_REPLAYS", "2"))
+# OPPROF_FLUSH=0 reads the device profiler only at device close, as the 2026-08-07 traced harness did
+# (50+ replays, no flush): reproduces the "Op N not present in cpp_device_perf_report.csv" merge failure.
+FLUSH = os.getenv("OPPROF_FLUSH", "1") == "1"
+TRACES = int(os.getenv("OPPROF_TRACES", "1"))  # 2 = two traces back to back, as that harness timed per arm
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
@@ -27,13 +31,16 @@ def test_traced_iteration_opprof(mesh_device, reset_seeds):
     ttnn.synchronize_device(mesh_device)
     idx.deallocate(True)
     hidden.deallocate(True)
-    ttnn.ReadDeviceProfiler(mesh_device)
-    tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
-    idx, hidden = body()
-    ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
-    for _ in range(REPLAYS):
-        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
+    if FLUSH:
         ttnn.ReadDeviceProfiler(mesh_device)
-    ttnn.release_trace(mesh_device, tid)
-    idx.deallocate(True)
-    hidden.deallocate(True)
+    for _ in range(TRACES):
+        tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+        idx, hidden = body()
+        ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+        for _ in range(REPLAYS):
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
+            if FLUSH:
+                ttnn.ReadDeviceProfiler(mesh_device)
+        ttnn.release_trace(mesh_device, tid)
+        idx.deallocate(True)
+        hidden.deallocate(True)
