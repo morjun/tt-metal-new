@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Standalone drafter, 3-step draft time: whole lm_head in DRAM vs 38,720 pinned cols vs 59,840 pinned cols +
-DRAM reload, plain (Tensix) and hidden (paced DRISC push) (fig13).
+DRAM reload, plain (Tensix) and hidden (paced DRISC push), and hidden with the logits kept in L1 (fig13).
 
-Reads generated/lmhead_l1_profile/standalone_fig13_hidden/results.json, written by
-run_pin_reload_standalone.py --arms A,D,R59840_64_8_rope,R59840_64_8_rope_drisc60c2 (one paired campaign).
+Reads generated/lmhead_l1_profile/standalone_fig13_logits_l1/results.json, written by
+run_pin_reload_standalone.py --arms A,D,R59840_64_8_rope,R59840_64_8_rope_drisc60c2,
+R59840_64_8_rope_drisc60c2+logitsl1 (one paired campaign).
 Style, palette and the public-figure checks come from plot_contributions.py.
 
     python research_codes/mm_profiling/plot_pin_reload.py [--out DIR]
@@ -16,15 +17,21 @@ from pathlib import Path
 
 from plot_contributions import BAR, BLUE, BLUE_L, DEFAULT_OUT, DRAFT, GRID, INK, VAL, plt, save, sg
 
-DATA = Path(__file__).resolve().parents[2] / "generated/lmhead_l1_profile/standalone_fig13_hidden/results.json"
+DATA = Path(__file__).resolve().parents[2] / "generated/lmhead_l1_profile/standalone_fig13_logits_l1/results.json"
 BLUE_D = "#174f91"  # a darker step of the pin's blue: the reload hidden
+BLUE_DD = "#0b2e5c"  # darker again: + logits kept in SRAM
 ARMS = [
     ("A", "Whole lm_head\nin DRAM", GRID),
     ("D", "38,720 columns\npinned in SRAM", BLUE_L),
     ("R59840_64_8_rope", "59,840 columns\npinned in SRAM\n+ reload from DRAM", BLUE),
     ("R59840_64_8_rope_drisc60c2", "59,840 columns\npinned in SRAM\n+ reload from DRAM,\nhidden", BLUE_D),
+    (
+        "R59840_64_8_rope_drisc60c2+logitsl1",
+        "59,840 columns\npinned in SRAM\n+ hidden reload\n+ logits kept\nin SRAM",
+        BLUE_DD,
+    ),
 ]
-TENSIX, HIDDEN = ARMS[2][0], ARMS[3][0]
+TENSIX, HIDDEN, LOGITS = ARMS[2][0], ARMS[3][0], ARMS[4][0]
 
 
 def main():
@@ -36,7 +43,7 @@ def main():
     med = {a: statistics.median(v) for a, v in runs.items()}
     pct = {a: 100 * (med[a] / med["A"] - 1) for a in med}
 
-    fig, ax = plt.subplots(figsize=(11, 5.8))
+    fig, ax = plt.subplots(figsize=(12.5, 6.2))
     best = ARMS[-1][0]
     for x, (a, label, color) in enumerate(ARMS):
         ax.bar(x, med[a], 0.58, color=color, **BAR)
@@ -47,7 +54,7 @@ def main():
     ax.set_ylim(0, max(med.values()) * 1.2)
     ax.set_ylabel("ms per 3-step draft (lower is better)")
     ax.grid(axis="x", visible=False)
-    ax.set_title(f"A larger pin with a hidden DRAM reload makes the draft {abs(pct[best]):.1f}% faster")
+    ax.set_title(f"Pinning, a hidden DRAM reload and on-chip logits make the draft {abs(pct[best]):.1f}% faster")
     spread = max(max(abs(x - med[a]) for x in v) for a, v in runs.items())
     save(
         fig,
@@ -55,7 +62,7 @@ def main():
         "fig13_lm_head_pin_reload_drafter",
         f"""
 Drafter alone: time of one 3-step draft with the drafter's lm_head in DRAM, partly pinned in
-on-chip SRAM, and pinned further with a reload from DRAM, plain and hidden.
+on-chip SRAM, pinned further with a reload from DRAM, plain and hidden, and with the logits kept on chip.
 
 The lm_head (1024 x 262,144, 512 MiB in bf16) is split along its columns: a leading slice is
 pinned in L1 width-sharded on all 110 cores, the rest stays in DRAM, and the two partial logits are
@@ -76,6 +83,10 @@ joined before the argmax. Bit-exact against the unsplit head.
   (60 GB/s in small pieces) so those operations are not slowed. The compute cores only start the
   copy and check it is done before the lm_head. {med[HIDDEN]:.3f} ms ({sg(pct[HIDDEN], 2)}%), that
   is {1e3 * (med[TENSIX] - med[HIDDEN]):.0f} us per draft faster than the plain reload.
+- The same, with the logits kept in SRAM: the two partial matmuls write their raw scores (one real
+  row, stored padded to 32 rows) to on-chip SRAM instead of DRAM, and only the single real row
+  goes to DRAM before the argmax. {med[LOGITS]:.3f} ms ({sg(pct[LOGITS], 2)}%), {1e3 * (med[HIDDEN] - med[LOGITS]):.0f} us
+  per draft faster than the hidden reload alone, bit-identical.
 
 The 59,840 size is for the drafter alone: in the full speculative loop the target model's own
 operations also reach into it, which was not measured. In every pinned arm the DRAM tail's matmul
