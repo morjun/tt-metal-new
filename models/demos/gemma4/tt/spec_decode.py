@@ -63,7 +63,27 @@ def _to_probs(logits_row, temperature, top_p, top_k):
     return probs / s if s > 0 else probs
 
 
-def argmax_last(assistant, logits, rows):
+def _untilize_logits(logits):
+    """Multicore untilize of one logits part. For L1 logits (research knob GEMMA4_LMHEAD_LOGITS_L1):
+    - unpad explicitly: ttnn.untilize drops the 32-row tile pad only for DRAM inputs (untilize.cpp:49),
+      so an L1 input would write all 32 rows;
+    - write the row to DRAM: in L1 it would sit under the split-logits concat's CBs (635,776 B on (0,0))."""
+    if logits.memory_config().buffer_type != ttnn.BufferType.L1:
+        return ttnn.untilize(logits, use_multicore=True)
+    end = [d - 1 for d in logits.shape]
+    return ttnn.untilize_with_unpadding(logits, end, memory_config=ttnn.DRAM_MEMORY_CONFIG, use_multicore=True)
+
+
+def _free_if_l1(consume, *logits):
+    """With consume (the caller frees its logits right after the argmax anyway), free L1 logits once
+    untilized: alive, they sit under the CBs of the concat / argmax that follow. The caller's own
+    deallocate afterwards is then a no-op."""
+    for t in logits:
+        if consume and t.memory_config().buffer_type == ttnn.BufferType.L1:
+            t.deallocate(True)
+
+
+def argmax_last(assistant, logits, rows, consume=False):
     """argmax over the last (vocab) dim — fast path. Returns [1,1,rows] uint32.
 
     The ONE implementation of the token pick. ``SpeculativeDecoder._argmax_last`` delegates here,
@@ -100,7 +120,8 @@ def argmax_last(assistant, logits, rows):
         # makes the returned index already a vocab id -- no offset arithmetic.
         # The alternative, argmax per part and pick the larger, needs each
         # part's max VALUE, and ttnn.max is slower than argmax itself (§2.10).
-        rm = [ttnn.untilize(p, use_multicore=True) for p in logits.parts]
+        rm = [_untilize_logits(p) for p in logits.parts]
+        _free_if_l1(consume, *logits.parts)
         # Research knob GEMMA4_LMHEAD_L1_RELOAD: this concat's CB holds the whole joined row and can
         # reach into a large pin; free the head around it (the bracket reads the cores from the program).
         with lm_head_reload.bracket("split-logits concat", *rm):

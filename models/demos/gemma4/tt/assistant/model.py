@@ -54,6 +54,18 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
 
 
+def _lm_head_logits_memory_config():
+    """Research knob GEMMA4_LMHEAD_LOGITS_L1=1 (default off): the split drafter lm_head (L1 slice + DRAM
+    tail) writes its padded 32-row logits to L1 interleaved instead of DRAM (gemma4-12b record §8). The
+    untilize after them still writes its one-row result to DRAM (spec_decode.argmax_last)."""
+    if os.getenv("GEMMA4_LMHEAD_LOGITS_L1") != "1":
+        return None
+    if not getattr(_lm_head_logits_memory_config, "logged", False):
+        logger.info("[lm-head-logits] GEMMA4_LMHEAD_LOGITS_L1: drafter lm_head logits in L1")
+        _lm_head_logits_memory_config.logged = True
+    return ttnn.L1_MEMORY_CONFIG
+
+
 class SplitLogits(NamedTuple):
     """Dense drafter logits produced as column-ordered parts, not one row.
 
@@ -491,16 +503,27 @@ class Gemma4AssistantModel:
                         normed,
                         self.lm_head_l1,
                         program_config=self.lm_head_l1_pc,
+                        memory_config=_lm_head_logits_memory_config(),
                         compute_kernel_config=self.lm_head_l1_ckc,
                     )
                 obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
-                tail = ttnn.linear(normed, self.lm_head, program_config=obw_pc, compute_kernel_config=obw_ckc)
+                tail = ttnn.linear(
+                    normed,
+                    self.lm_head,
+                    program_config=obw_pc,
+                    memory_config=_lm_head_logits_memory_config(),
+                    compute_kernel_config=obw_ckc,
+                )
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     head = ccl_allgather(head, self.mesh_config, self.ccl_manager)
                     tail = ccl_allgather(tail, self.mesh_config, self.ccl_manager)
                 logits = SplitLogits(parts=(head, tail))
             else:
                 obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
+                if os.getenv("GEMMA4_LMHEAD_LOGITS_L1") == "1":
+                    # Measured wrong on the whole head (record §8): the automatic matmul config computes
+                    # different logits with an L1 output, and argmax garbles on the untilize of an L1 input.
+                    raise ValueError("GEMMA4_LMHEAD_LOGITS_L1 needs the split head (GEMMA4_LMHEAD_L1_COLS > 0)")
                 logits = ttnn.linear(normed, self.lm_head, program_config=obw_pc, compute_kernel_config=obw_ckc)
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)

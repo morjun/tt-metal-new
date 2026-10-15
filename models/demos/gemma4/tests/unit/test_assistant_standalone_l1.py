@@ -384,7 +384,7 @@ def _make_fused_k_body(rig, k, mode="full"):
         for _ in range(k):
             logits, h = assistant.step(tok, h, shared_kv, page_tables, pu, pi, return_logits=want_logits)
             if mode == "full":
-                last = argmax_last(assistant, logits, rows=1)
+                last = argmax_last(assistant, logits, rows=1, consume=True)
                 logits.deallocate(True)
                 # ROW_MAJOR reshape is a free VIEW of `last`. Never deallocate
                 # either one: freeing the view hands its storage back and a later
@@ -804,7 +804,13 @@ def test_fused_draft_k_steps(mesh_device, reset_seeds):
     rows = []
     for k in ks:
         fused_ms, cap_s = _time_fused_k_steps(mesh_device, rig, k)
-        ctl_ms = _time_per_step_replay(mesh_device, rig, k)
+        if os.getenv("GEMMA4_LMHEAD_LOGITS_L1") == "1":
+            # The control's logits are persistent trace outputs; in L1 they sit under the split-logits
+            # concat's CBs. Only the fused rows are measured with this knob.
+            logger.info("[fused-k] GEMMA4_LMHEAD_LOGITS_L1: per-step-replay control skipped")
+            ctl_ms = float("nan")
+        else:
+            ctl_ms = _time_per_step_replay(mesh_device, rig, k)
         rows.append((k, fused_ms, ctl_ms))
         logger.info(
             f"{k:>3} {fused_ms:>14.3f} {fused_ms/k:>9.3f} {k*1e3/fused_ms:>9.2f} "
@@ -831,7 +837,7 @@ def test_fused_draft_k_steps(mesh_device, reset_seeds):
     # they are the same graph plus one eager argmax + readback, so the control is
     # only slightly worse there; the gap is what grows with K.
     for k, fused_ms, ctl_ms in rows:
-        if k > 1:
+        if k > 1 and ctl_ms == ctl_ms:  # NaN: control skipped (GEMMA4_LMHEAD_LOGITS_L1)
             assert ctl_ms > fused_ms, f"K={k}: fused ({fused_ms:.3f} ms) did not beat per-step replay ({ctl_ms:.3f} ms)"
     # Scaling check: a chained trace should be close to linear in K, since every
     # step is the same graph and nothing is amortized across steps. A large

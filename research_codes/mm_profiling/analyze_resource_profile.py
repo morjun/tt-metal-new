@@ -26,7 +26,7 @@ from pathlib import Path
 
 AICLK_GHZ = 1.35
 DRAM_PEAK_GBPS = 444.7  # measured, record §5.4
-ALIAS = {"R59840_64_8_rope_drisc60c2": "B59"}
+ALIAS = {"R59840_64_8_rope_drisc60c2": "B59", "R59840_64_8_rope_drisc60c2+logitsl1": "B59L"}
 KIND = {
     "Matmul": "Matmul",
     "SdpaDecode": "Attention",
@@ -38,6 +38,7 @@ KIND = {
     "ShardedToInterleaved": "Layout conversion",
     "TilizeWithValPadding": "Layout conversion",
     "UntilizeWithUnpadding": "Layout conversion",
+    "Untilize": "Layout conversion",  # untilize of an L1 input keeps the 32-row pad (GEMMA4_LMHEAD_LOGITS_L1)
     "Copy": "Layout conversion",
     "BinaryNg": "Eltwise",
     "Unary": "Eltwise",
@@ -86,6 +87,8 @@ SEGMENT = {
     "post_projection": {
         ("UntilizeWithUnpadding", 0): "untilize logits (L1 slice or whole)",
         ("UntilizeWithUnpadding", 1): "untilize logits (DRAM tail)",
+        ("Untilize", 0): "untilize logits (L1 slice or whole)",
+        ("Untilize", 1): "untilize logits (DRAM tail)",
         ("Concat", 0): "concat split logits",
         ("ArgMax", 0): "argmax",
     },

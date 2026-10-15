@@ -50,7 +50,11 @@ def arm_spec(arm):
     """A fixed arm, or R<cols>_<tail per_core_N>_<tail out_block_w>[_rope][_drisc[<GB/s>][c<pages>]] (pin + reload
     at another size; _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE; _drisc
     pushes the reload from the DRAM cores during the window, GEMMA4_LMHEAD_L1_RELOAD_DRISC, optionally paced to
-    <GB/s> (…_DRISC_GBPS) with <pages>-page DMA chunks (…_DRISC_CHUNK))."""
+    <GB/s> (…_DRISC_GBPS) with <pages>-page DMA chunks (…_DRISC_CHUNK)). A "+logitsl1" suffix on any arm also
+    writes the drafter lm_head logits to L1 (GEMMA4_LMHEAD_LOGITS_L1)."""
+    if arm.endswith("+logitsl1"):
+        base, extra, width = arm_spec(arm[: -len("+logitsl1")])
+        return base, {**extra, "GEMMA4_LMHEAD_LOGITS_L1": "1"}, width
     if arm in ARMS:
         return ARMS[arm][0], ARMS[arm][1], WIDTH[arm]
     m = re.fullmatch(r"R(\d+)_(\d+)_(\d+)(_rope)?(_drisc(\d+)?(?:c(\d+))?)?", arm)
@@ -76,7 +80,9 @@ def arm_spec(arm):
 
 def parse(log):
     # the K-sweep row "  3  <fused ms/iter> <ms/step> <tok/s/u> <control ms/iter> <ms/step> <speedup>x"
-    fused = re.search(r"(?:^|- )\s*3\s+([\d.]+)\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+x", log, re.M)
+    # (control columns are "nan" when the control is skipped: GEMMA4_LMHEAD_LOGITS_L1)
+    n = r"(?:[\d.]+|nan)"
+    fused = re.search(rf"(?:^|- )\s*3\s+([\d.]+)\s+[\d.]+\s+[\d.]+\s+{n}\s+{n}\s+{n}x", log, re.M)
     part = {
         name: float(m.group(1))
         for name, pat in (
@@ -146,6 +152,8 @@ def main():
         print(row, flush=True)
         if proc.returncode != 0 or row["total"] is None or width != expected_width:
             raise SystemExit(f"cell {name} failed its exit/width gate: width={width}")
+        if ("+logitsl1" in arm) != ("[lm-head-logits] GEMMA4_LMHEAD_LOGITS_L1" in proc.stdout):
+            raise SystemExit(f"cell {name}: logits-in-L1 knob gate failed")
         want = ([], [32]) if "_drisc" in arm else ([32], [])  # (Tensix reloads, DRISC reloads)
         if arm.startswith("R") and (
             not reg or (reloads, drisc_reloads) != want or (arm == "R" and reg[:1] != ["589824"])
