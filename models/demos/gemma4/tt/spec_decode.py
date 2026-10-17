@@ -167,7 +167,8 @@ def argmax_last(assistant, logits, rows, consume=False):
     pad_mode = (os.environ.get("GEMMA4_ARGMAX_PAD32") or "0").strip().lower()
     pad = pad_mode in ("1", "true", "yes", "on") or (pad_mode == "multirow" and rows > 1)
     if not pad:
-        u = ttnn.untilize(logits, use_multicore=True)
+        u = _untilize_logits(logits)
+        _free_if_l1(consume, logits)
         idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
         u.deallocate(True)
         return idx
