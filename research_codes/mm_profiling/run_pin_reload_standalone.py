@@ -46,6 +46,23 @@ ARMS = {
 WIDTH = {"A": set(), "B": {("262144", "75", "5")}, "D": {("223424", "64", "8")}, "R": {("209344", "60", "4")}}
 
 
+# "+blk<group><cap>" arm suffix (record §9.2): per-shape in0_block_w cap (GEMMA4_MM_BLOCK_CAP_SHAPES) on the drafter
+# matmuls of one group; each shape gets the largest divisor of its Kt that is <= cap
+BLK_GROUPS = {
+    "fatk": [(4096, 1024), (8192, 1024), (7680, 1024)],  # o_proj sliding, down_proj / o_proj global, pre_projection
+    "wide": [(1024, 8192), (1024, 9216), (1024, 3840)],  # qkv sliding / gate / up, qkv global, post_projection
+}
+
+
+def blk_expected(arm):
+    """{(K, N): in0_block_w} the arm's +blk suffixes should produce."""
+    out = {}
+    for group, cap in re.findall(r"\+blk(fatk|wide)(\d+)", arm):
+        for k, n in BLK_GROUPS[group]:
+            out[(k, n)] = max(d for d in range(1, int(cap) + 1) if (k // 32) % d == 0)
+    return out
+
+
 def arm_spec(arm):
     """A fixed arm, or R<cols>_<tail per_core_N>_<tail out_block_w>[_rope][_drisc[<GB/s>][c<pages>]] (pin + reload
     at another size; _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE; _drisc
@@ -55,7 +72,8 @@ def arm_spec(arm):
     suffixes (record §9.2) also pin those drafter weights L1 WIDTH_SHARDED (GEMMA4_L1_PIN; p = own grid with that
     per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r". A "+fatk_dram_ring"
     suffix runs the fat-K matmuls (o_proj, down_proj; the ring guard refuses pre_projection) as the gather_in0 ring
-    with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2)."""
+    with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2). "+blkfatk<cap>" / "+blkwide<cap>" cap
+    in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES)."""
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
@@ -76,6 +94,13 @@ def arm_spec(arm):
         if ring:
             extra.update({"GEMMA4_GATHER_IN0": "1", "GEMMA4_GATHER_DEBUG": "1"})
         return base, extra, width
+    m = re.search(r"\+blk(fatk|wide)(\d+)$", arm)
+    if m:
+        base, extra, width = arm_spec(arm[: m.start()])
+        group, cap = m.groups()
+        spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
+        spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
+        return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
     if arm.endswith("+fatk_dram_ring"):
         base, extra, width = arm_spec(arm[: -len("+fatk_dram_ring")])
         return (

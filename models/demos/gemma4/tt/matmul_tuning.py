@@ -51,8 +51,10 @@ def _env_on(name):
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _block_cap():
-    """Ceiling on ``in0_block_w``. Default 8; ``GEMMA4_MM_BLOCK_CAP`` overrides.
+def _block_cap(shape=None):
+    """Ceiling on ``in0_block_w``. Default 8; ``GEMMA4_MM_BLOCK_CAP`` overrides, and
+    ``GEMMA4_MM_BLOCK_CAP_SHAPES="<K>x<N>=<cap>;..."`` overrides it for those (K, N) only
+    (gemma4-12b record §9.2: DRAM read rate vs blocking per matmul shape).
 
     The 8 is a heuristic, not a ttnn rule — the only hard constraints are
     ``Kt % in0_block_w == 0`` and, for a width-sharded in0,
@@ -72,6 +74,11 @@ def _block_cap():
     TARGET only (``DEFAULT_SCOPES``), so changing this knob moves the 35-layer
     target by default and the drafter only when the tuner is force-enabled.
     """
+    if shape is not None:
+        for entry in os.getenv("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";"):
+            key, _, cap = entry.strip().partition("=")
+            if key and key == f"{shape[0]}x{shape[1]}":
+                return max(1, int(cap))
     try:
         return max(1, int(os.getenv("GEMMA4_MM_BLOCK_CAP", "8")))
     except ValueError:
@@ -125,9 +132,10 @@ def derive_decode_1d_config(m, k, n, max_x=8, max_y=8, in0_shard_tiles=None):
     cores = gx * gy
     if cores < 2:
         return None
-    blk = _largest_divisor(kt)
+    cap = _block_cap((k, n))
+    blk = _largest_divisor(kt, cap)
     if in0_shard_tiles:
-        blk = _largest_divisor(in0_shard_tiles, cap=min(_block_cap(), in0_shard_tiles))
+        blk = _largest_divisor(in0_shard_tiles, cap=min(cap, in0_shard_tiles))
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
         in0_block_w=blk,
