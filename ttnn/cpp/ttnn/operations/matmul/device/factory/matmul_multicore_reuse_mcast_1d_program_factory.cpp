@@ -5,6 +5,7 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
@@ -577,6 +578,11 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     // in1 is the reader of weights/output writer, and we choose to make it use the optimized reader noc
     tt_metal::NOC in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
     tt_metal::NOC in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD §5.5.12 part 8): swap the in0 / in1 NoCs, to test
+    // whether per-core DRAM read order follows the NoC route. Off unless the env var is set.
+    if (std::getenv("TT_MM1D_MCAST_IN0_SWAP_NOCS") != nullptr) {
+        std::swap(in0_noc, in1_noc);
+    }
 
     if (fuse_op && fused_op_signaler->is_all_gather()) {
         // Create semaphores
@@ -3531,6 +3537,11 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     // in1 is the reader of weights/output writer, and we choose to make it use the optimized reader noc
     tt_metal::NOC in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
     tt_metal::NOC in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD §5.5.12 part 8): swap the in0 / in1 NoCs, to test
+    // whether per-core DRAM read order follows the NoC route. Off unless the env var is set.
+    if (std::getenv("TT_MM1D_MCAST_IN0_SWAP_NOCS") != nullptr) {
+        std::swap(in0_noc, in1_noc);
+    }
 
     ////////////////////////////////////////////////////////////////////////////
     //                      Build Kernel Descriptors

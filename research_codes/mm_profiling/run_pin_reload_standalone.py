@@ -73,7 +73,8 @@ def arm_spec(arm):
     per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r". A "+fatk_dram_ring"
     suffix runs the fat-K matmuls (o_proj, down_proj; the ring guard refuses pre_projection) as the gather_in0 ring
     with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2). "+blkfatk<cap>" / "+blkwide<cap>" cap
-    in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES)."""
+    in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
+    NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in)."""
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
@@ -101,6 +102,11 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    if arm.endswith("+nocswap"):
+        # every 1D-mcast matmul's in1 reader + writer on NoC1 and its in0 kernels on NoC0
+        # (mcast1d_swap_nocs.patch; record §5.5.12 part 8, §9.2)
+        base, extra, width = arm_spec(arm[: -len("+nocswap")])
+        return base, {**extra, "TT_MM1D_MCAST_IN0_SWAP_NOCS": "1"}, width
     if arm.endswith("+fatk_dram_ring"):
         base, extra, width = arm_spec(arm[: -len("+fatk_dram_ring")])
         return (
