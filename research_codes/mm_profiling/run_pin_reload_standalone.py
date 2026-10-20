@@ -53,7 +53,9 @@ def arm_spec(arm):
     <GB/s> (…_DRISC_GBPS) with <pages>-page DMA chunks (…_DRISC_CHUNK)). A "+logitsl1" suffix on any arm also
     writes the drafter lm_head logits to L1 (GEMMA4_LMHEAD_LOGITS_L1). Trailing "+pin<weight>[@<layers>][p<per_core_N>][r]"
     suffixes (record §9.2) also pin those drafter weights L1 WIDTH_SHARDED (GEMMA4_L1_PIN; p = own grid with that
-    per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r"."""
+    per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r". A "+fatk_dram_ring"
+    suffix runs the fat-K matmuls (o_proj, down_proj; the ring guard refuses pre_projection) as the gather_in0 ring
+    with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2)."""
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
@@ -74,6 +76,13 @@ def arm_spec(arm):
         if ring:
             extra.update({"GEMMA4_GATHER_IN0": "1", "GEMMA4_GATHER_DEBUG": "1"})
         return base, extra, width
+    if arm.endswith("+fatk_dram_ring"):
+        base, extra, width = arm_spec(arm[: -len("+fatk_dram_ring")])
+        return (
+            base,
+            {**extra, "GEMMA4_GATHER_IN0": "1", "GEMMA4_GATHER_DRAM_WEIGHT": "1", "GEMMA4_GATHER_DEBUG": "1"},
+            width,
+        )
     if arm.endswith("+logitsl1"):
         base, extra, width = arm_spec(arm[: -len("+logitsl1")])
         return base, {**extra, "GEMMA4_LMHEAD_LOGITS_L1": "1"}, width
@@ -184,9 +193,8 @@ def main():
         print(row, flush=True)
         if proc.returncode != 0 or row["total"] is None or width != expected_width:
             raise SystemExit(f"cell {name} failed its exit/width gate: width={width}")
-        if ("+pin" in arm) != (row["pinned_tensors"] > 0) or (arm.endswith("r") and "+pin" in arm) != (
-            row["ring_takes"] > 0
-        ):
+        ring = (arm.endswith("r") and "+pin" in arm) or "+fatk_dram_ring" in arm
+        if ("+pin" in arm) != (row["pinned_tensors"] > 0) or ring != (row["ring_takes"] > 0):
             raise SystemExit(
                 f"cell {name}: pin/ring gate failed: {row['pinned_tensors']} pinned, {row['ring_takes']} ring"
             )

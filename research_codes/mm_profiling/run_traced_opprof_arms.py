@@ -111,6 +111,8 @@ def main():
         ok = proc.returncode == 0 and pp.returncode == 0 and bool(csvs)
         if ("+pin" in arm) != ("largest tensors pinned to L1" in proc.stdout):
             raise SystemExit(f"{out.name}: pin gate failed (arm pins weights but none were pinned, or vice versa)")
+        if "+fatk_dram_ring" in arm and not all(f"[gather] TAKE {k}x1024" in proc.stdout for k in (4096, 8192)):
+            raise SystemExit(f"{out.name}: fat-K ring gate failed (o_proj / down_proj did not take the ring)")
         failed += not ok
         print(
             f"{out.name}: exit {proc.returncode}/{pp.returncode}, legacy csv {bool(csvs)}, "
