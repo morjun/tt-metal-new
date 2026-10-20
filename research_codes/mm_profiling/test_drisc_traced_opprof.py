@@ -11,6 +11,7 @@ profiler after each replay, so the profile has the ops back to back as in the ti
 """
 
 import os
+from loguru import logger
 
 import ttnn
 from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric
@@ -25,7 +26,10 @@ TRACES = int(os.getenv("OPPROF_TRACES", "1"))  # 2 = two traces back to back, as
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
 def test_traced_iteration_opprof(mesh_device, reset_seeds):
-    rig = _build_standalone(mesh_device, "dram", tune_matmuls=os.getenv("GEMMA4_TUNE_MATMULS", "1") == "1")
+    mode = os.getenv("GEMMA4_STANDALONE_PLACEMENT", "dram")  # l1_sharded: GEMMA4_L1_PIN weights (record §9.2)
+    rig = _build_standalone(mesh_device, mode, tune_matmuls=os.getenv("GEMMA4_TUNE_MATMULS", "1") == "1")
+    if rig["placement"].enabled:
+        logger.info("\n" + rig["placement"].report())
     body = _make_fused_k_body(rig, 3)
     idx, hidden = body()  # compile before capture
     ttnn.synchronize_device(mesh_device)

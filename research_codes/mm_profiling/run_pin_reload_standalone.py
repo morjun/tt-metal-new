@@ -51,7 +51,29 @@ def arm_spec(arm):
     at another size; _rope also brackets the global layer's rotary embedding, GEMMA4_LMHEAD_L1_RELOAD_ROPE; _drisc
     pushes the reload from the DRAM cores during the window, GEMMA4_LMHEAD_L1_RELOAD_DRISC, optionally paced to
     <GB/s> (…_DRISC_GBPS) with <pages>-page DMA chunks (…_DRISC_CHUNK)). A "+logitsl1" suffix on any arm also
-    writes the drafter lm_head logits to L1 (GEMMA4_LMHEAD_LOGITS_L1)."""
+    writes the drafter lm_head logits to L1 (GEMMA4_LMHEAD_LOGITS_L1). Trailing "+pin<weight>[@<layers>][p<per_core_N>][r]"
+    suffixes (record §9.2) also pin those drafter weights L1 WIDTH_SHARDED (GEMMA4_L1_PIN; p = own grid with that
+    per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r"."""
+    if "+pin" in arm:
+        base, *pins = arm.split("+pin")
+        base, extra, width = arm_spec(base)
+        spec, ring = [], False
+        for pin in pins:
+            m = re.fullmatch(r"([a-z_]+)(?:@([\d-]+))?(?:p(\d+))?(r)?", pin)
+            if not m:
+                raise SystemExit(f"unknown pin {pin!r} in {arm}")
+            name, layers, pcn, r = m.groups()
+            spec.append(name + (f"@{layers}" if layers else "") + (f":{pcn}" if pcn else ""))
+            ring |= bool(r)
+        extra = {
+            **extra,
+            "GEMMA4_STANDALONE_PLACEMENT": "l1_sharded",
+            "GEMMA4_L1_PIN": ";".join(spec),
+            "GEMMA4_L1_WEIGHT_BUDGET_MB": "4096",
+        }
+        if ring:
+            extra.update({"GEMMA4_GATHER_IN0": "1", "GEMMA4_GATHER_DEBUG": "1"})
+        return base, extra, width
     if arm.endswith("+logitsl1"):
         base, extra, width = arm_spec(arm[: -len("+logitsl1")])
         return base, {**extra, "GEMMA4_LMHEAD_LOGITS_L1": "1"}, width
@@ -93,7 +115,17 @@ def parse(log):
         )
         if (m := re.search(pat, log))
     }
-    return {"fused_ms_per_iter": float(fused.group(1)) if fused else None, **part}
+    out = re.search(r"\[fused-k\] K=3 output: token=\[(\d+)\] hidden_sha256=(\w+)", log)
+    pinned = re.search(r"\[placement:[^\]]*\] mode=l1_sharded L1=([\d.]+) MB/device over (\d+) tensors", log)
+    return {
+        "fused_ms_per_iter": float(fused.group(1)) if fused else None,
+        **part,
+        "token": int(out.group(1)) if out else None,
+        "hidden_sha": out.group(2) if out else None,
+        "pinned_mb": float(pinned.group(1)) if pinned else 0.0,
+        "pinned_tensors": int(pinned.group(2)) if pinned else 0,
+        "ring_takes": log.count("[gather] TAKE"),
+    }
 
 
 def main():
@@ -152,11 +184,19 @@ def main():
         print(row, flush=True)
         if proc.returncode != 0 or row["total"] is None or width != expected_width:
             raise SystemExit(f"cell {name} failed its exit/width gate: width={width}")
-        if ("+logitsl1" in arm) != ("[lm-head-logits] GEMMA4_LMHEAD_LOGITS_L1" in proc.stdout):
+        if ("+pin" in arm) != (row["pinned_tensors"] > 0) or (arm.endswith("r") and "+pin" in arm) != (
+            row["ring_takes"] > 0
+        ):
+            raise SystemExit(
+                f"cell {name}: pin/ring gate failed: {row['pinned_tensors']} pinned, {row['ring_takes']} ring"
+            )
+        if ("+logitsl1" in arm.split("+pin")[0]) != ("[lm-head-logits] GEMMA4_LMHEAD_LOGITS_L1" in proc.stdout):
             raise SystemExit(f"cell {name}: logits-in-L1 knob gate failed")
         want = ([], [32]) if "_drisc" in arm else ([32], [])  # (Tensix reloads, DRISC reloads)
-        if arm.startswith("R") and (
-            not reg or (reloads, drisc_reloads) != want or (arm == "R" and reg[:1] != ["589824"])
+        if (
+            arm.startswith("R")
+            and "+pin" not in arm
+            and (not reg or (reloads, drisc_reloads) != want or (arm == "R" and reg[:1] != ["589824"]))
         ):
             raise SystemExit(f"cell {name}: reload gate failed: S={reg} reloads={reloads} drisc={drisc_reloads}")
     for key in ("fused_ms_per_iter", "backbone", "head", "argmax", "total"):

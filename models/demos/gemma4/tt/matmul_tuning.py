@@ -284,11 +284,26 @@ class DecodeMatmulTuner:
         except Exception:  # noqa: BLE001
             return None
 
+    @staticmethod
+    def _weight_shard_grid(w):
+        """(cores, shard width in tiles, grid x, grid y) of an L1 WIDTH_SHARDED weight on a row-major
+        prefix from (0, 0), else None."""
+        if not DecodeMatmulTuner._l1_width_sharded(w):
+            return None
+        spec = w.memory_config().shard_spec
+        ranges = list(spec.grid.ranges())
+        if any(r.start.x != 0 for r in ranges) or min(r.start.y for r in ranges) != 0:
+            return None
+        gx = max(r.end.x for r in ranges) + 1
+        gy = max(r.end.y for r in ranges) + 1
+        return spec.grid.num_cores(), int(spec.shape[1]) // ttnn.TILE_SIZE, gx, gy
+
     def config_for(self, x, w):
         if not self.enabled:
             return None
         shard_tiles = self._in0_shard_tiles(x)
-        key = (tuple(x.shape), tuple(w.shape), shard_tiles)
+        w_grid = self._weight_shard_grid(w)
+        key = (tuple(x.shape), tuple(w.shape), shard_tiles, w_grid)
         if key not in self._cache:
             pc = derive_decode_1d_config(
                 int(x.shape[-2]),
@@ -298,6 +313,23 @@ class DecodeMatmulTuner:
                 self._max_y,
                 in0_shard_tiles=shard_tiles,
             )
+            if pc is not None and w_grid is not None:
+                cores, pcn, gx, gy = w_grid
+                tuned = pc.compute_with_storage_grid_size
+                if (pcn, cores) != (pc.per_core_N, tuned.x * tuned.y):
+                    # Weight pinned on its own grid (GEMMA4_L1_PIN per_core_N, gemma4-12b record §9.2): run on
+                    # the shard's cores. Same in0_block_w, so the K accumulation order is unchanged.
+                    pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+                        in0_block_w=pc.in0_block_w,
+                        out_subblock_h=1,
+                        out_subblock_w=1,
+                        per_core_M=pc.per_core_M,
+                        per_core_N=pcn,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
             self._cache[key] = pc
             # One line per DISTINCT shape (the cache makes this fire once each), so
             # this stays ~10 lines for a 35-layer model and gives the attribution

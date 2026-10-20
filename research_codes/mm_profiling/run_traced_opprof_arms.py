@@ -99,10 +99,18 @@ def main():
         if csvs:
             shutil.copy(csvs[-1], out / "ops_perf.csv")
         npe = sorted(rep.rglob("npe_viz"))
-        if npe:
+        if npe and mode == "noc":
             shutil.copytree(npe[-1], out / "npe_viz", dirs_exist_ok=True)
+        elif npe:
+            # outside noc mode the post-processor leaves a copy of the last noc run's generated/profiler/npe_viz
+            # (1.3 GB) in the report; it is not this cell's data
+            for d in npe:
+                shutil.rmtree(d)
+            npe = []
         dropped = len(re.findall(r"markers were dropped", log))
         ok = proc.returncode == 0 and pp.returncode == 0 and bool(csvs)
+        if ("+pin" in arm) != ("largest tensors pinned to L1" in proc.stdout):
+            raise SystemExit(f"{out.name}: pin gate failed (arm pins weights but none were pinned, or vice versa)")
         failed += not ok
         print(
             f"{out.name}: exit {proc.returncode}/{pp.returncode}, legacy csv {bool(csvs)}, "

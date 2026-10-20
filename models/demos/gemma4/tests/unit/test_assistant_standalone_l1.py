@@ -468,7 +468,10 @@ def test_lm_head_l1_address_capture(mesh_device, reset_seeds):
 
     assert profile.enabled(), "set GEMMA4_LMHEAD_PROFILE_OUT to a fresh output directory"
     assert os.getenv("GEMMA4_SPEC_DRAFT_LEN", "3") == "3"
-    rig = _build_standalone(mesh_device, "dram", tune_matmuls=os.getenv("GEMMA4_TUNE_MATMULS", "1") == "1")
+    mode = os.getenv("GEMMA4_STANDALONE_PLACEMENT", "dram")  # l1_sharded: GEMMA4_L1_PIN weights (record §9.2)
+    rig = _build_standalone(mesh_device, mode, tune_matmuls=os.getenv("GEMMA4_TUNE_MATMULS", "1") == "1")
+    if rig["placement"].enabled:
+        logger.info("\n" + rig["placement"].report())
     if rig["assistant"].lm_head_l1 is not None:
         assert profile._owners({"head": rig["assistant"].lm_head_l1}), "pinned head owner was not resolved"
     profile.snapshot(mesh_device, "assistant_loaded", {"assistant": rig["assistant"]})
@@ -794,8 +797,13 @@ def test_fused_draft_k_steps(mesh_device, reset_seeds):
     # decodes at, not only at 512. L1_WEIGHT_PINNING.md:274 retracted every number taken on
     # the predecessor that stopped at the logits.
     ctx = int(os.getenv("GEMMA4_STANDALONE_CTX", str(DEFAULT_CONTEXT)))
-    rig = _build_standalone(mesh_device, "dram", context_len=ctx, max_seq_len=max(1024, ctx))
+    # GEMMA4_STANDALONE_PLACEMENT=l1_sharded pins the weights GEMMA4_L1_PIN selects (gemma4-12b record §9.2);
+    # default "dram" keeps every recorded arm unchanged.
+    mode = os.getenv("GEMMA4_STANDALONE_PLACEMENT", "dram")
+    rig = _build_standalone(mesh_device, mode, context_len=ctx, max_seq_len=max(1024, ctx))
     logger.info(f"[fused-k] context_len={ctx} (GEMMA4_STANDALONE_CTX)")
+    if rig["placement"].enabled:
+        logger.info("\n" + rig["placement"].report())
 
     logger.info(
         f"{'K':>3} {'fused ms/iter':>14} {'ms/step':>9} {'tok/s/u':>9} "

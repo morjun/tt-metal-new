@@ -74,6 +74,19 @@ def _parse_layer_spec(spec):
     return frozenset(out)
 
 
+def _parse_pin_spec(spec):
+    """ "down_proj@0;gate_proj@0-3:3" -> ((substring, layers, per_core_N or None), ...)."""
+    out = []
+    for entry in (spec or "").split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        head, _, pcn = entry.partition(":")
+        sub, _, layers = head.partition("@")
+        out.append((sub.strip(), _parse_layer_spec(layers), int(pcn) if pcn.strip() else None))
+    return tuple(out)
+
+
 def _pick_grid(n_tiles, max_x=8, max_y=8):
     """Largest core rectangle whose core count divides n_tiles.
 
@@ -152,6 +165,12 @@ class WeightPlacement:
     #: Names carry ``layer_<i>/``, so this filters on the parsed index.
     #: Env: GEMMA4_L1_LAYERS="0,1,2" or "0-3".
     layers: tuple = ()
+    #: Per-weight pin list, superseding ``only`` / ``layers`` when set. Entries are
+    #: ``<substring>[@<layers>][:<per_core_N>]`` separated by ``;``, e.g.
+    #: ``down_proj@0;gate_proj@0:3;post_projection:2``. ``per_core_N`` shards the weight on
+    #: the row-major prefix of ceil(Nt / per_core_N) cores of the full device grid instead
+    #: of the tuner's grid (gemma4-12b record §9.2). Env: GEMMA4_L1_PIN.
+    pins: tuple = ()
     #: Defer all sharding to an explicit post-load pass. Required for the TARGET,
     #: whose weights also serve prefill: a decode-shaped shard makes prefill's
     #: auto-selected config FATAL, so the reshard must wait until prefill is done
@@ -170,6 +189,9 @@ class WeightPlacement:
             self.only = tuple(s.strip() for s in raw.split(",") if s.strip()) if raw else ()
         if not self.layers:
             self.layers = _parse_layer_spec(os.getenv("GEMMA4_L1_LAYERS", ""))
+        if not self.pins:
+            self.pins = _parse_pin_spec(os.getenv("GEMMA4_L1_PIN", ""))
+        self._pcn = {}
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
@@ -217,6 +239,18 @@ class WeightPlacement:
     def sharded(self) -> bool:
         return self.mode == "l1_sharded"
 
+    def _pin_for(self, name):
+        """The first GEMMA4_L1_PIN entry matching this weight name, or None."""
+        m = _LAYER_RE.search(name or "")
+        for sub, layers, pcn in self.pins:
+            if sub in name and (not layers or (m is not None and int(m.group(1)) in layers)):
+                return sub, layers, pcn
+        return None
+
+    def per_core_n(self, name):
+        """per_core_N override for a pinned weight (GEMMA4_L1_PIN), or None for the tuner's grid."""
+        return self._pcn.get(name)
+
     def _layer_allowed(self, name):
         if not self.layers:
             return True
@@ -256,7 +290,14 @@ class WeightPlacement:
             # Dummy-weight paths pass a None tensor; nothing to account for.
             self.entries.append(_Entry(name, 0, False, "unknown shape"))
             return ttnn.DRAM_MEMORY_CONFIG
-        if self.only and not any(s in name for s in self.only):
+        if self.pins:
+            pin = self._pin_for(name)
+            if pin is None:
+                self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_PIN"))
+                return ttnn.DRAM_MEMORY_CONFIG
+            if pin[2] is not None:
+                self._pcn[name] = pin[2]
+        elif self.only and not any(s in name for s in self.only):
             self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_ONLY"))
             return ttnn.DRAM_MEMORY_CONFIG
         if not self._layer_allowed(name):
@@ -330,7 +371,22 @@ def resolve(placement):
     return placement if placement is not None else DRAM_ONLY
 
 
-def shard_l1_width(tensor, mesh_device):
+def prefix_core_range_set(num_cores, width):
+    """The first ``num_cores`` cores, row-major, of a grid ``width`` cores wide, from (0, 0).
+
+    This is the core order the 1D mcast factory walks (``num_cores_with_work`` row-major
+    over its grid), so a weight sharded here lines up with that factory's cores.
+    """
+    rows, rem = divmod(num_cores, width)
+    ranges = []
+    if rows:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(width - 1, rows - 1)))
+    if rem:
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, rows), ttnn.CoreCoord(rem - 1, rows)))
+    return ttnn.CoreRangeSet(set(ranges))
+
+
+def shard_l1_width(tensor, mesh_device, per_core_n=None):
     """Reshard a loaded weight to L1 WIDTH_SHARDED on the matmul's compute grid.
 
     Each core ends up holding exactly the N-slice it multiplies, which is what
@@ -356,6 +412,23 @@ def shard_l1_width(tensor, mesh_device):
     if len(local) < 2:
         return None
     k, n = int(local[-2]), int(local[-1])
+
+    if per_core_n is not None:
+        # GEMMA4_L1_PIN per_core_N: the row-major prefix of the full device grid; the last
+        # shard may be partial. DecodeMatmulTuner reads the grid back from the shard spec.
+        if k % T or n % T:
+            return None
+        grid_size = mesh_device.compute_with_storage_grid_size()
+        cores = -(-(n // T) // per_core_n)
+        if cores > grid_size.x * grid_size.y:
+            return None
+        grid = prefix_core_range_set(cores, grid_size.x)
+        mc = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(grid, [k, per_core_n * T], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        return ttnn.to_memory_config(tensor, mc)
 
     pc = derive_decode_1d_config(1, k, n)
     if pc is None:
@@ -423,7 +496,7 @@ def place_as_tensor(
         if not wanted:
             return tensor
         try:
-            moved = shard_l1_width(tensor, device)
+            moved = shard_l1_width(tensor, device, per_core_n=placement.per_core_n(name))
             if moved is None:
                 # Normal for norms / non-matmul weights: give the budget back and
                 # record it, but do not shout about it.
