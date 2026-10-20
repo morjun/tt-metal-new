@@ -215,8 +215,8 @@ def fig16(out):
     ax2.text(us.max(), 103, "link fully used", ha="right", va="bottom", fontsize=9, color=MUTED)
     ax2.text(
         us[int(n * 0.25)],
-        smooth(hot_t)[int(n * 0.25)] + 6,
-        f"busiest link (row {hot[0]}, eastbound from the DRAM column)",
+        smooth(hot_t).max() + 6,  # above the line's peaks, not on them
+        f"busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1})",
         fontsize=10,
         color=INK,
         ha="left",
@@ -235,11 +235,11 @@ much of each link's bandwidth it needs.
 
 - Left: for every router, the busiest of its links, averaged over the matmul (% of that link's
   bandwidth). "D" squares are the DRAM columns; the dark ones are the endpoints that served the reads.
-- Right: over time, the modelled demand on the single busiest link (eastbound out of the DRAM column on
-  row {hot[0]}) against the average over all {len(mean)} links.
+- Right: over time, the modelled demand on the single busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1}:
+  eastbound, leaving the DRAM column) against the average over all {len(mean)} links.
 
 The averaged figure most profiling summaries report (about 11% here) says the network is nearly idle.
-The same model puts the busiest link, eastbound on row {hot[0]} next to a DRAM column, at 130-160% of its
+The same model puts the busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1}) at 130-160% of its
 bandwidth for most of the matmul, and several other links next to the DRAM columns at 50-100% on
 average. So the network is not idle where the DRAM data enters it. This is a model of the recorded
 transfers, not a measurement of the links.
