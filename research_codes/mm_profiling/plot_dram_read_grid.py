@@ -29,6 +29,7 @@ from plot_contributions import AXIS, DEFAULT_OUT, GRID, INK, INK2, MUTED, ORANGE
 
 CELLS = Path(__file__).resolve().parents[2] / "generated/lmhead_l1_profile/phase2_noc_timeline"
 A0, W2 = CELLS / "00_noc_B+logitsl1", CELLS / "01_noc_B+logitsl1+blkwide2"
+GRIDWIDE = CELLS.parent / "phase2_gridwide"  # 06 A (64 cores), 07 wide grid (86 / 96), 08 wide grid + 16 K-steps
 ROWS, COLS, DRAM_COLS = 12, 17, (0, 9)
 # reference sequential ramps (dataviz palette.md): blue for read rate, orange for modelled link demand
 BLUES = LinearSegmentedColormap.from_list("b", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])
@@ -163,7 +164,9 @@ cores the matmul does not use.
 - lm_head (bottom middle): 110 cores at 3.4 GB/s each, uniformly. Each core needs so little that
   none of them is the limit; the DRAM itself is (about 400 GB/s in total).
 
-Rates are issued bytes per second from a per-transfer trace of one profiled run. Tracing slows some
+Rates are issued bytes per second from a per-transfer trace of one profiled run. They are effective
+rates (bytes issued over time, including each core's waits), not a direct measurement of DRAM
+bandwidth. Tracing slows some
 matmuls (down_proj by about 24%), so the absolute values here are lower than in untraced runs; the
 pattern is what the figure shows. The lm_head trace's timestamps run about 7% long, so its values are
 about 7% low.
@@ -247,10 +250,60 @@ transfers, not a measurement of the links.
     save(fig, out, "fig16_npe_link_demand", desc)
 
 
+def fig17(out):
+    a = GRIDWIDE / "06_noc_B+logitsl1"
+    wide = GRIDWIDE / "07_noc_B+logitsl1+gridwide"
+    wide16 = GRIDWIDE / "08_noc_B+logitsl1+gridwide+blkwide2"
+    g86, ends = dram_reads(npeviz(wide, "gate_proj (sliding)", 0))
+    g86b, _ = dram_reads(npeviz(wide16, "gate_proj (sliding)", 0))
+    q96, ends_q = dram_reads(npeviz(wide, "qkv_proj (global)"))
+    q96b, _ = dram_reads(npeviz(wide16, "qkv_proj (global)"))
+    g64, ends64 = dram_reads(npeviz(a, "gate_proj (sliding)", 0))
+    panels = [
+        (per_core_rate(g86, 0, 12), ends, "gate_proj, 86 cores: 0-12 us"),
+        (per_core_rate_alive(g86, 26, 36), ends, "gate_proj, 86 cores: 26-36 us"),
+        (per_core_rate(g86b), ends, "gate_proj, 86 cores, 16 blocks"),
+        (per_core_rate(q96, 0, 15), ends_q, "global-layer qkv, 96 cores: 0-15 us"),
+        (per_core_rate(q96b), ends_q, "global-layer qkv, 96 cores, 16 blocks"),
+        (per_core_rate(g64, 0, 20), ends64, "reference: gate_proj, 64 cores: 0-20 us"),
+    ]
+    vmax = 12.0
+    fig, axs = plt.subplots(2, 3, figsize=(16, 8.6))
+    for ax, (vals, eps, title) in zip(axs.flat, panels):
+        grid(ax, vals, BLUES, vmax, eps, title)
+    colorbar(fig, axs.ravel().tolist(), BLUES, vmax, "DRAM read rate per core, GB/s (issued weight bytes per second)")
+    desc = """
+The same per-core map as the previous figure, for the backbone matmuls spread over more cores: the
+gate / up / qkv weights of the sliding-window layers on 86 cores instead of 64, and the global layer's
+qkv on 96 instead of 48. Each square is one compute core, labelled with how fast it pulled its weights
+from DRAM (GB/s); "D" squares are the DRAM columns, the dark ones the endpoints that served the reads.
+
+- gate_proj on 86 cores, first 12 us (top left), before any core has finished: the extra cores in
+  columns 13-15 read alongside the others, and together the cores pull 405 GB/s, against 380 on 64
+  cores in their first 20 us (bottom right). The lower rows still get about twice the share of the
+  upper rows.
+- 26-36 us (top middle): by then only rows 2-5 are still reading. As on 64 cores, these upper-row cores
+  speed up once the lower rows have finished, so their low rate is a share, not a cap.
+- read in 16 blocks (top right): every core reads at about the same rate and they finish together; the
+  end tail disappears.
+- global-layer qkv on 96 cores (bottom left and middle): the same pattern (407 GB/s in total in its
+  first 15 us), and the same fix.
+
+On untraced runs this layout makes these matmuls about 15% faster, and about 18% with 16 blocks. With
+both, they reach about 93% of the effective rate (weight bytes over matmul time) of the large
+output-head matmul.
+
+Rates are issued bytes per second from a per-transfer trace of one profiled run. They are effective
+rates (bytes issued over time, including each core's waits), not a direct measurement of DRAM
+bandwidth. Tracing slows the matmuls a little, so the absolute values are lower than untraced.
+"""
+    save(fig, out, "fig17_dram_read_rate_grid_wide", desc)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default="fig15,fig16")
+    p.add_argument("--only", default="fig15,fig16,fig17")
     args = p.parse_args()
     for name in args.only.split(","):
         globals()[name](args.out)
