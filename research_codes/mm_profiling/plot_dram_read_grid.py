@@ -174,23 +174,36 @@ about 7% low.
     save(fig, out, "fig15_dram_read_rate_grid", desc)
 
 
+# tt-npe's per-link timeline values are raw demand in bytes/cycle (npeDeviceModelUtils.hpp:135, npeStats.cpp:322);
+# only its grid-wide statistics are scaled to %. Its Blackhole model gives every link 60.9 B/cycle
+# (device_models/blackhole.hpp:246). NOC*_IN / NOC*_OUT entries are endpoint (NIU) demand, not links.
+NPE_LINK_BW = 60.9
+NPE_LINKS = {"NOC0_EAST": (0, 1), "NOC0_SOUTH": (1, 0), "NOC1_NORTH": (-1, 0), "NOC1_WEST": (0, -1)}
+
+
 def fig16(out):
     d = npeviz(A0, "gate_proj (sliding)", 0)
     _, ends = dram_reads(d)
     ts = sorted(d["timestep_data"], key=lambda t: t["start_cycle"])
     n = len(ts)
-    mean = defaultdict(float)
+    mean = defaultdict(float)  # (row, col, link) -> mean demand, % of the link's modelled bandwidth
     for t in ts:
         for _, r, c, kind, dem in t["link_demand"]:
-            mean[(r, c, kind)] += dem / n
+            if kind in NPE_LINKS:
+                mean[(r, c, kind)] += dem / NPE_LINK_BW * 100 / n
+    # each link drawn on the router it leads INTO, so a link leaving a DRAM column shows on the core next to it
     busiest = {}
     for (r, c, kind), v in mean.items():
-        if c not in DRAM_COLS or kind.endswith("EAST") or kind.endswith("WEST"):
-            busiest[(r, c)] = max(busiest.get((r, c), 0.0), v)
+        dr, dc = NPE_LINKS[kind]
+        rc = ((r + dr) % ROWS, (c + dc) % COLS)
+        busiest[rc] = max(busiest.get(rc, 0.0), v)
     hot = max(mean, key=mean.get)
+    over = sum(1 for v in mean.values() if v > 100)
     us = np.array([t["start_cycle"] / MHZ for t in ts])
-    avg = np.array([t["avg_link_util"] for t in ts])
-    hot_t = np.array([next((x[4] for x in t["link_demand"] if (x[1], x[2], x[3]) == hot), 0.0) for t in ts])
+    avg = np.array([t["avg_link_demand"] for t in ts])  # already % (grid average over every link)
+    hot_t = np.array(
+        [next((x[4] for x in t["link_demand"] if (x[1], x[2], x[3]) == hot), 0.0) / NPE_LINK_BW * 100 for t in ts]
+    )
     k = 32  # ~0.76 us smoothing, so the lines are readable
 
     def smooth(y):
@@ -199,14 +212,14 @@ def fig16(out):
     fig = plt.figure(figsize=(15, 6.2))
     gs = fig.add_gridspec(1, 2, width_ratios=[1.15, 1])
     ax = fig.add_subplot(gs[0])
-    vmax = 120.0
+    vmax = 200.0
     grid(
         ax,
         {rc: v for rc, v in busiest.items() if rc[1] not in DRAM_COLS},
         ORANGES,
         vmax,
         ends,
-        "Busiest NoC link at each router, average over the matmul",
+        "Busiest NoC link into each router, average over the matmul",
         fmt="{:.0f}",
         fs=7,
     )
@@ -215,37 +228,42 @@ def fig16(out):
     ax2.plot(us, smooth(hot_t), color=ORANGE, lw=2)
     ax2.plot(us, smooth(avg), color=BLUE, lw=2)
     ax2.axhline(100, color=AXIS, lw=1, ls=(0, (4, 3)))
-    ax2.text(us.max(), 103, "link fully used", ha="right", va="bottom", fontsize=9, color=MUTED)
+    ax2.text(us[int(n * 0.02)], 103, "link fully used", ha="left", va="bottom", fontsize=9, color=MUTED)
     ax2.text(
         us[int(n * 0.25)],
-        smooth(hot_t).max() + 6,  # above the line's peaks, not on them
+        smooth(hot_t).max() + 8,  # above the line's peaks, not on them
         f"busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1})",
         fontsize=10,
         color=INK,
         ha="left",
     )
     ax2.text(
-        us[int(n * 0.25)], smooth(avg)[int(n * 0.25)] + 6, "average over all links", fontsize=10, color=INK, ha="left"
+        us[int(n * 0.25)], smooth(avg)[int(n * 0.25)] + 8, "average over all links", fontsize=10, color=INK, ha="left"
     )
     ax2.set_xlabel("time since the matmul started, us")
-    ax2.set_ylabel("modelled demand, %")
-    ax2.set_ylim(0, 180)
+    ax2.set_ylabel("modelled demand, % of the link's bandwidth")
+    ax2.set_ylim(0, 300)
     ax2.set_title("Average link versus the busiest link over time", fontsize=11)
     desc = f"""
 What the NoC congestion model (tt-npe) says about the same gate_proj matmul (64 cores, weights read from
-DRAM). The model replays every recorded transfer through the chip's network-on-chip and estimates how
-much of each link's bandwidth it needs.
+DRAM). The model replays every recorded transfer through the chip's network-on-chip in 32-cycle steps.
+In each step, every transfer that is in flight adds the bandwidth it is trying to use to every link on
+its route (routes go along the row first, then along the column). A link's "demand" is that sum, shown
+as a percentage of the link's bandwidth in the model. Every core asks for the same number of bytes, but
+a link next to a DRAM column, or on a row segment many routes share, carries the data of every core
+routed through it, so its demand is many times that of a link at the edge of the grid. Above 100%, more
+data wants the link than it can carry.
 
-- Left: for every router, the busiest of its links, averaged over the matmul (% of that link's
-  bandwidth). "D" squares are the DRAM columns; the dark ones are the endpoints that served the reads.
-- Right: over time, the modelled demand on the single busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1}:
-  eastbound, leaving the DRAM column) against the average over all {len(mean)} links.
+- Left: for every router, the busiest link leading into it, averaged over the matmul. "D" squares are
+  the DRAM columns; the dark ones are the endpoints that served the reads.
+- Right: over time, the demand on the single busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1}: eastbound,
+  leaving the DRAM column) against the average over all links.
 
-The averaged figure most profiling summaries report (about 11% here) says the network is nearly idle.
-The same model puts the busiest link (row {hot[0]}, column {hot[1]} → {hot[1] + 1}) at 130-160% of its
-bandwidth for most of the matmul, and several other links next to the DRAM columns at 50-100% on
-average. So the network is not idle where the DRAM data enters it. This is a model of the recorded
-transfers, not a measurement of the links.
+The averaged figure most profiling summaries report (about 16% average demand and 11% average use, apart
+from a brief spike when the last reads drain) says the network is nearly idle. The same model puts the
+busiest link at {mean[hot]:.0f}% on average over the matmul, and {over} links in all above 100%. Every one of
+them lies on the row of a DRAM endpoint, at most four columns east of it. So the network is not idle where the
+DRAM data enters it. This is a model of the recorded transfers, not a measurement of the links.
 """
     save(fig, out, "fig16_npe_link_demand", desc)
 
