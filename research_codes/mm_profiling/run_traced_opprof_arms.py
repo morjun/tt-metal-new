@@ -30,7 +30,7 @@ from pathlib import Path
 
 from run_lmhead_e2e import REPO, setup_overlay
 from run_lmhead_obw_e2e import env_for
-from run_pin_reload_standalone import arm_spec, blk_expected
+from run_pin_reload_standalone import GRID_WIDE, arm_spec, blk_expected
 
 ALIAS = {"B59": "R59840_64_8_rope_drisc60c2"}
 MODES = {
@@ -115,6 +115,11 @@ def main():
             tuned = [line for line in proc.stdout.splitlines() if f"M=1 K={k} N={n} -> TUNED" in line]
             if not tuned or any(f"in0_block_w={blk} " not in line for line in tuned):
                 raise SystemExit(f"{out.name}: block-cap gate failed ({k}x{n} did not get in0_block_w={blk})")
+        for (k, n), (pcn, gx, gy) in GRID_WIDE.items() if "+gridwide" in arm else ():
+            want = f"M=1 K={k} N={n} -> TUNED grid={gx}x{gy} "
+            tuned = [line for line in proc.stdout.splitlines() if want in line]
+            if not tuned or any(f"per_core_N={pcn}" not in line for line in tuned):
+                raise SystemExit(f"{out.name}: grid gate failed ({k}x{n} not on {gx}x{gy} with per_core_N={pcn})")
         if "+fatk_dram_ring" in arm and not all(f"[gather] TAKE {k}x1024" in proc.stdout for k in (4096, 8192)):
             raise SystemExit(f"{out.name}: fat-K ring gate failed (o_proj / down_proj did not take the ring)")
         failed += not ok

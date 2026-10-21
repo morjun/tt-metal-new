@@ -85,6 +85,20 @@ def _block_cap(shape=None):
         return 8
 
 
+def _grid_override(shape):
+    """per_core_N from ``GEMMA4_MM_GRID_SHAPES="<K>x<N>=<per_core_N>;..."`` for a (K, N) matmul, else None.
+
+    Runs a weight that is NOT L1 WIDTH_SHARDED (DRAM interleaved) on the row-major prefix of
+    ceil(Nt / per_core_N) cores of the full device grid instead of the tuner's <= 8x8 rectangle
+    (gemma4-12b record §9.2: DRAM read rate vs reading-core count).
+    """
+    for entry in os.getenv("GEMMA4_MM_GRID_SHAPES", "").split(";"):
+        key, _, pcn = entry.strip().partition("=")
+        if key and key == f"{shape[0]}x{shape[1]}":
+            return max(1, int(pcn))
+    return None
+
+
 def _largest_divisor(n, cap=None):
     cap = _block_cap() if cap is None else cap
     for d in range(min(n, cap), 0, -1):
@@ -338,6 +352,23 @@ class DecodeMatmulTuner:
                         fused_activation=None,
                         mcast_in0=True,
                     )
+            elif pc is not None and (pcn := _grid_override((int(x.shape[-1]), int(w.shape[-1])))) is not None:
+                full = w.device().compute_with_storage_grid_size()
+                cores = -(-(int(w.shape[-1]) // ttnn.TILE_SIZE) // pcn)
+                if cores > full.x * full.y:
+                    raise ValueError(f"GEMMA4_MM_GRID_SHAPES: {cores} cores do not fit the {full.x}x{full.y} grid")
+                # Same in0_block_w as the tuner's config, so only the reading-core count changes.
+                pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                    compute_with_storage_grid_size=ttnn.CoreCoord(min(cores, full.x), -(-cores // full.x)),
+                    in0_block_w=pc.in0_block_w,
+                    out_subblock_h=1,
+                    out_subblock_w=1,
+                    per_core_M=pc.per_core_M,
+                    per_core_N=pcn,
+                    fuse_batch=True,
+                    fused_activation=None,
+                    mcast_in0=True,
+                )
             self._cache[key] = pc
             # One line per DISTINCT shape (the cache makes this fire once each), so
             # this stays ~10 lines for a 35-layer model and gives the attribution

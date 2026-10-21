@@ -54,6 +54,11 @@ BLK_GROUPS = {
 }
 
 
+# "+gridwide" (record §9.2): (K, N) -> (per_core_N, grid x, grid y) on the 11 x 10 grid, i.e. the widest legal
+# DRAM-fed grid: ceil(Nt / per_core_N) cores = 86, 96, 60
+GRID_WIDE = {(1024, 8192): (3, 11, 8), (1024, 9216): (3, 11, 9), (1024, 3840): (2, 11, 6)}
+
+
 def blk_expected(arm):
     """{(K, N): in0_block_w} the arm's +blk suffixes should produce."""
     out = {}
@@ -102,6 +107,11 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    if arm.endswith("+gridwide"):
+        # DRAM-fed qkv / gate / up on 86 cores, global qkv on 96, post_projection on 60 (GEMMA4_MM_GRID_SHAPES)
+        base, extra, width = arm_spec(arm[: -len("+gridwide")])
+        spec = ";".join(f"{k}x{n}={pcn}" for (k, n), (pcn, _, _) in GRID_WIDE.items())
+        return base, {**extra, "GEMMA4_MM_GRID_SHAPES": spec}, width
     if arm.endswith("+nocswap"):
         # every 1D-mcast matmul's in1 reader + writer on NoC1 and its in0 kernels on NoC0
         # (mcast1d_swap_nocs.patch; record §5.5.12 part 8, §9.2)
