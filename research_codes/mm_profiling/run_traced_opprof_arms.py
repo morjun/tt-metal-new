@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from run_lmhead_e2e import REPO, setup_overlay
@@ -81,6 +82,7 @@ def main():
         cmd = [sys.executable, "-m", "tracy", "-r", "-p", "-v", *flags, "-m", "pytest", "-s", "-q"]
         cmd.append("research_codes/mm_profiling/test_drisc_traced_opprof.py")
         print("running", out.name, flush=True)
+        cell_start = time.time()
         proc = subprocess.run(cmd, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         log = proc.stdout
         for name in ("cpp_device_perf_report.csv", "tracy_ops_data.csv"):
@@ -101,12 +103,13 @@ def main():
         npe = sorted(rep.rglob("npe_viz"))
         if npe and mode == "noc":
             shutil.copytree(npe[-1], out / "npe_viz", dirs_exist_ok=True)
-        elif npe:
-            # outside noc mode the post-processor leaves a copy of the last noc run's generated/profiler/npe_viz
-            # (1.3 GB) in the report; it is not this cell's data
-            for d in npe:
+        # Every report written during this cell carries an npe_viz copy: this cell's named report (copied into the cell
+        # above for noc cells), and the timestamped report the tracy run itself writes, which outside noc mode holds a
+        # stale copy of the last noc run's generated/profiler/npe_viz (1.3-6 GB each). The cell keeps the only copy.
+        for d in REPORTS.glob("*/npe_viz"):
+            if d.stat().st_mtime >= cell_start - 1:
                 shutil.rmtree(d)
-            npe = []
+        npe = npe if mode == "noc" else []
         dropped = len(re.findall(r"markers were dropped", log))
         ok = proc.returncode == 0 and pp.returncode == 0 and bool(csvs)
         if ("+pin" in arm) != ("largest tensors pinned to L1" in proc.stdout):
