@@ -135,6 +135,13 @@ def arm_spec(arm):
         return base, {**extra, "GEMMA4_LMHEAD_LOGITS_L1": "1"}, width
     if arm in ARMS:
         return ARMS[arm][0], ARMS[arm][1], WIDTH[arm]
+    m = re.fullmatch(r"P(\d+)_(\d+)_(\d+)", arm)
+    if m:
+        # head pin of <cols> columns WITHOUT a reload (fits the 772,032 B/bank no-reload budget, record §9.1), DRAM
+        # tail on its own per_core_N / out_block_w (record §9.2 additivity test)
+        cols, pcn, obw = m.groups()
+        extra = {"GEMMA4_LMHEAD_L1_COLS": cols, "GEMMA4_LMHEAD_DRAFT_OBW": obw, "GEMMA4_LMHEAD_DRAFT_PCN": pcn}
+        return "D", extra, {(str(262144 - int(cols)), pcn, obw)}
     m = re.fullmatch(r"R(\d+)_(\d+)_(\d+)(_rope)?(_drisc(\d+)?(?:c(\d+))?)?", arm)
     if not m:
         raise SystemExit(f"unknown arm {arm}")
