@@ -107,6 +107,13 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    m = re.search(r"\+niusample(\d*)$", arm)
+    if m:
+        # sample the 1D-mcast in1 reader's NIU read-word counter per block, and with a number every that many
+        # wall-clock ticks (TT_MM1D_IN1_NIU_SAMPLE -> MM_IN1_NIU_SAMPLE in the in1 reader, needs build_codex_current;
+        # record §9.2 item 6b)
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "TT_MM1D_IN1_NIU_SAMPLE": m.group(1) or "1"}, width
     m = re.search(r"\+vc([0-3])$", arm)
     if m:
         # per-core static VC of every 1D-mcast matmul's in1 read requests (TT_MM1D_IN1_VC_MODE; record §5.5.12 part 9,
@@ -135,6 +142,11 @@ def arm_spec(arm):
         return base, {**extra, "GEMMA4_LMHEAD_LOGITS_L1": "1"}, width
     if arm in ARMS:
         return ARMS[arm][0], ARMS[arm][1], WIDTH[arm]
+    m = re.fullmatch(r"H(\d+)_(\d+)", arm)
+    if m:
+        # whole lm_head in DRAM (no pin) on an explicit per_core_N / out_block_w (record §9.2 whole-head re-sweep)
+        pcn, obw = m.groups()
+        return "B", {"GEMMA4_LMHEAD_DRAFT_OBW": obw, "GEMMA4_LMHEAD_DRAFT_PCN": pcn}, {("262144", pcn, obw)}
     m = re.fullmatch(r"P(\d+)_(\d+)_(\d+)", arm)
     if m:
         # head pin of <cols> columns WITHOUT a reload (fits the 772,032 B/bank no-reload budget, record §9.1), DRAM

@@ -77,6 +77,9 @@ def main():
             # NoC event and counter markers overflow the default profiler DRAM buffer within one iteration
             # (tt-npe's advice for NoC traces; counters fill BRISC's buffer)
             env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = os.getenv("OPPROF_PROGRAMS", "10000")
+        elif "+niusample" in arm:
+            # timed NIU samples (item 6b) overflow the default buffer the same way
+            env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = os.getenv("OPPROF_PROGRAMS", "40000")
         if mode == "noc":
             npe_env(env)
         cmd = [sys.executable, "-m", "tracy", "-r", "-p", "-v", *flags, "-m", "pytest", "-s", "-q"]
@@ -85,6 +88,12 @@ def main():
         cell_start = time.time()
         proc = subprocess.run(cmd, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         log = proc.stdout
+        if "+niusample" in arm and (LOGS / "profile_log_device.csv").exists():
+            # keep only the sampler's rows (device-log header + IN1_NIU_RD_WORDS); the raw log is not kept
+            with open(LOGS / "profile_log_device.csv") as src, open(out / "niu_samples.csv", "w") as dst:
+                for i, line in enumerate(src):
+                    if i < 2 or "IN1_NIU_RD_WORDS" in line:
+                        dst.write(line)
         for name in ("cpp_device_perf_report.csv", "tracy_ops_data.csv"):
             if (LOGS / name).exists() and mode == "time":
                 shutil.copy(LOGS / name, out / name)
