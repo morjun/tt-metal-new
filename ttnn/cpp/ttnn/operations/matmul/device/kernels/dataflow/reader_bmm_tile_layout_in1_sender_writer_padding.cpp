@@ -193,6 +193,26 @@ void kernel_main() {
 
     Noc noc;
     DataflowBuffer dfb_in1(dfb_id_in1);
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD §5.5.12 part 9): static VC for this RISC's read requests.
+    // In DM_DEDICATED_NOC mode the read path never rewrites the read cmd buffer's NOC_CTRL (the VC
+    // argument of noc_async_read is ignored, noc_nonblocking_api.h:489-493), so set it once here and
+    // restore firmware's VC 1 at the end. 0 = untouched (control); 1 = logical y & 3; 2 = logical x & 3;
+    // 3 = (x + y) & 3. Set by the factory from TT_MM1D_IN1_VC_MODE (gemma4-12b record §9.2).
+#ifndef MM_IN1_VC_MODE
+#define MM_IN1_VC_MODE 0
+#endif
+#if MM_IN1_VC_MODE != 0
+    const uint32_t in1_rd_vc = MM_IN1_VC_MODE == 1   ? (get_absolute_logical_y() & 0x3u)
+                               : MM_IN1_VC_MODE == 2 ? (get_absolute_logical_x() & 0x3u)
+                                                     : ((get_absolute_logical_x() + get_absolute_logical_y()) & 0x3u);
+    while (!noc_cmd_buf_ready(noc_index, read_cmd_buf)) {
+    }
+    NOC_CMD_BUF_WRITE_REG(
+        noc_index,
+        read_cmd_buf,
+        NOC_CTRL,
+        NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(in1_rd_vc));
+#endif
     DataflowBuffer dfb_out(dfb_id_out0);
     Semaphore<> sender_sem(get_compile_time_arg_val(10));
     Semaphore<> receiver_sem(get_compile_time_arg_val(11));
@@ -689,4 +709,14 @@ void kernel_main() {
         batch * out_num_nonzero_subblocks_h * out_num_nonzero_subblocks_w * out_subblock_w * out_subblock_h);
 #endif
     noc.async_write_barrier();
+#if MM_IN1_VC_MODE != 0
+    noc.async_read_barrier();
+    while (!noc_cmd_buf_ready(noc_index, read_cmd_buf)) {
+    }
+    NOC_CMD_BUF_WRITE_REG(
+        noc_index,
+        read_cmd_buf,
+        NOC_CTRL,
+        NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(1));
+#endif
 }

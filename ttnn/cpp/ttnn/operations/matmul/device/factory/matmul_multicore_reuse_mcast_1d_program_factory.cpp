@@ -583,6 +583,11 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     if (std::getenv("TT_MM1D_MCAST_IN0_SWAP_NOCS") != nullptr) {
         std::swap(in0_noc, in1_noc);
     }
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD §5.5.12 part 9, §9.2): per-core static VC of the in1 reader's read
+    // requests (MM_IN1_VC_MODE in reader_bmm_tile_layout_in1_sender_writer_padding.cpp). Off unless the env var is set.
+    if (const char* vc_mode = std::getenv("TT_MM1D_IN1_VC_MODE"); vc_mode != nullptr) {
+        mm_kernel_in1_sender_writer_defines["MM_IN1_VC_MODE"] = vc_mode;
+    }
 
     if (fuse_op && fused_op_signaler->is_all_gather()) {
         // Create semaphores
@@ -3541,6 +3546,11 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     // whether per-core DRAM read order follows the NoC route. Off unless the env var is set.
     if (std::getenv("TT_MM1D_MCAST_IN0_SWAP_NOCS") != nullptr) {
         std::swap(in0_noc, in1_noc);
+    }
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD §5.5.12 part 9, §9.2): per-core static VC of the in1 reader's read
+    // requests (MM_IN1_VC_MODE in reader_bmm_tile_layout_in1_sender_writer_padding.cpp). Off unless the env var is set.
+    if (const char* vc_mode = std::getenv("TT_MM1D_IN1_VC_MODE"); vc_mode != nullptr) {
+        mm_kernel_in1_sender_writer_defines["MM_IN1_VC_MODE"] = vc_mode;
     }
 
     ////////////////////////////////////////////////////////////////////////////

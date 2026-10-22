@@ -107,6 +107,12 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    m = re.search(r"\+vc([0-3])$", arm)
+    if m:
+        # per-core static VC of every 1D-mcast matmul's in1 read requests (TT_MM1D_IN1_VC_MODE; record §5.5.12 part 9,
+        # §9.2): 1 = logical y & 3, 2 = logical x & 3, 3 = (x + y) & 3
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "TT_MM1D_IN1_VC_MODE": m.group(1)}, width
     if arm.endswith("+gridwide"):
         # DRAM-fed qkv / gate / up on 86 cores, global qkv on 96, post_projection on 60 (GEMMA4_MM_GRID_SHAPES)
         base, extra, width = arm_spec(arm[: -len("+gridwide")])
