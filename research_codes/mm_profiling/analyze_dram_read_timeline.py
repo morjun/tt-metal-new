@@ -13,6 +13,11 @@ issue), its mean rate, the rate in each tenth of the window, and the time to fir
 the first core's last read, and the tail is what is issued after it. Ops are labelled with analyze_resource_profile.label_session and averaged over the steps and
 layers sharing a label.
 
+Trace guard: per op and core, the profiler pushes inside the core's kernels and the overrun (last DRAM read issue minus
+that core's own kernel end). An op is INVALID when any call's max overrun exceeds --overrun-threshold-us (default 10,
+chosen from the distribution over all cells: backbone -4..+6 us, DRAM-fed lm_head +20..+111 us). Invalid ops' rates
+are reported but must not be used.
+
     python analyze_dram_read_timeline.py <noc_cell_dir> [--bin-us 1.0] -> <cell>/dram_timeline.{json,md}
 """
 
@@ -29,12 +34,53 @@ LAYER_TYPES = ["sliding", "sliding", "sliding", "global"]
 MHZ = 1350.0  # P150 AICLK under load; checked against FW cycles / ns in ops_perf
 
 
-def dram_reads(npeviz):
-    d = json.loads(subprocess.run(["zstd", "-dc", str(npeviz)], capture_output=True, check=True).stdout)
+def load_npeviz(npeviz):
+    return json.loads(subprocess.run(["zstd", "-dc", str(npeviz)], capture_output=True, check=True).stdout)
+
+
+def dram_reads(d):
     reads = [t for t in d["noc_transfers"] if t["noc_event_type"] == "READ"]
     dsts = {tuple(x) for t in reads for x in t["dst"]}
     dram = {tuple(t["src"]) for t in reads} - dsts
     return [(t["start_cycle"] / MHZ, t["total_bytes"], tuple(t["dst"][0])) for t in reads if tuple(t["src"]) in dram]
+
+
+def trace_guard(d, reads):
+    """Per core (dev, row, col): (profiler pushes inside its kernels, overrun us).
+
+    overrun = the core's last DRAM read issue minus the end of its own kernel (latest of BRISC-KERNEL and
+    NCRISC-KERNEL, from the same trace). A read cannot be issued after its kernel ends, so a positive overrun means
+    the trace's timestamps for that core are not trustworthy. Pushes = PROFILER-NOC-QUICK-PUSH zones nested in the
+    core's kernels (mid-kernel flushes of the profiler buffer), reported to check, not assume, a link to overruns.
+    """
+    kernel_end, pushes = defaultdict(float), defaultdict(int)
+    for z in d["zones"]:
+        core = tuple(z["core"])
+        for k in z["zones"]:
+            if "-KERNEL[" in k["id"]:
+                kernel_end[core] = max(kernel_end[core], k["end"] / MHZ)
+                pushes[core] += sum(1 for x in k["zones"] if x["id"].startswith("PROFILER-NOC-QUICK-PUSH"))
+    last = defaultdict(lambda: float("-inf"))
+    for t, _, core in reads:
+        last[core] = max(last[core], t)
+    return {c: (pushes[c], last[c] - kernel_end[c]) for c in last if c in kernel_end}
+
+
+def guard_summary(g):
+    """Distribution over cores of the per-core overrun and push count for one op call."""
+    ov = sorted(v for _, v in g.values())
+    pu = sorted(p for p, _ in g.values())
+    q = lambda xs, f: xs[min(len(xs) - 1, int(f * (len(xs) - 1) + 0.5))]
+    return {
+        "cores": len(ov),
+        "overrun_min_us": ov[0],
+        "overrun_median_us": q(ov, 0.5),
+        "overrun_p90_us": q(ov, 0.9),
+        "overrun_max_us": ov[-1],
+        "cores_overrun_gt0": sum(1 for v in ov if v > 0),
+        "pushes_median": q(pu, 0.5),
+        "pushes_max": pu[-1],
+    }
 
 
 def profile(reads, bin_us):
@@ -85,6 +131,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("cell", type=Path)
     p.add_argument("--bin-us", type=float, default=1.0)
+    # From the distribution over every noc cell to date (record §9.2, trace validity): every backbone matmul's per-op
+    # max overrun is -4.0 .. +6.0 us; every DRAM-fed lm_head call is +20.1 .. +111.4 us. 10 us sits between them.
+    p.add_argument("--overrun-threshold-us", type=float, default=10.0)
     args = p.parse_args()
     (session,) = load(args.cell / "ops_perf.csv").values()
     files = {
@@ -97,9 +146,15 @@ def main():
         if o["op"] != "Matmul":
             continue
         f = files.get(int(o["row"]["GLOBAL CALL COUNT"]) // 1024)
-        reads = dram_reads(f) if f else []
+        if not f:
+            continue
+        d = load_npeviz(f)
+        reads = dram_reads(d)
         if reads:
-            per_label[name].append({"layer": layer, "kernel_us": o["dur"], **profile(reads, args.bin_us)})
+            guard = guard_summary(trace_guard(d, reads))
+            per_label[name].append(
+                {"layer": layer, "kernel_us": o["dur"], **profile(reads, args.bin_us), "guard": guard}
+            )
     out = {}
     for name, calls in per_label.items():
         mean = lambda k: statistics.mean(c[k] for c in calls)
@@ -127,21 +182,34 @@ def main():
             "ramp_us": statistics.mean(c["ramp_us"] for c in calls if c["ramp_us"] is not None),
             "tenths_gbs": [statistics.mean(c["tenths_gbs"][i] for c in calls) for i in range(10)],
             "series_gbs": calls[0]["series_gbs"],
+            # per-op max overrun over the calls; invalid = any call above the threshold
+            "overrun_max_us": max(c["guard"]["overrun_max_us"] for c in calls),
+            "overrun_median_us": statistics.median(c["guard"]["overrun_median_us"] for c in calls),
+            "cores_overrun_gt0": max(c["guard"]["cores_overrun_gt0"] for c in calls),
+            "pushes_max": max(c["guard"]["pushes_max"] for c in calls),
+            "valid": all(c["guard"]["overrun_max_us"] <= args.overrun_threshold_us for c in calls),
         }
     (args.cell / "dram_timeline.json").write_text(json.dumps(out, indent=1) + "\n")
     lines = [
         f"DRAM read rate inside each matmul, {args.cell.name} (noc mode, issue-time bins of {args.bin_us} us)",
         "",
+        f"Trace guard: overrun = a core's last DRAM read minus its own kernel end; an op is INVALID if any call's max"
+        f" overrun > {args.overrun_threshold_us:g} us. Invalid ops' rates are shown but must not be used.",
+        "",
         "| op | calls | cores | kernel us (noc mode) | first read us | read window us | MB | mean GB/s | steady GB/s | ramp to 90% us"
-        " | GB/s while all cores read | cores' last read: first / median / last us | tail us (MB) | tenths of the window, GB/s |",
-        "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|",
+        " | GB/s while all cores read | cores' last read: first / median / last us | tail us (MB) | tenths of the window, GB/s"
+        " | guard: max / median overrun us, cores > 0, pushes/core max |",
+        "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|",
     ]
     for name, r in sorted(out.items(), key=lambda x: -x[1]["mb"]):
         lines.append(
             f"| {name} | {r['calls']} | {r['cores']:.0f} | {r['kernel_us']:.1f} | {r['t_first_us']:.2f} | {r['window_us']:.1f}"
             f" | {r['mb']:.2f} | {r['mean_gbs']:.0f} | {r['steady_gbs']:.0f} | {r['ramp_us']:.1f} | {r['all_cores_gbs']:.0f}"
             f" | {r['core_end_min_us']:.1f} / {r['core_end_median_us']:.1f} / {r['core_end_max_us']:.1f}"
-            f" | {r['tail_us']:.1f} ({r['tail_mb']:.2f}) | " + " ".join(f"{x:.0f}" for x in r["tenths_gbs"]) + " |"
+            f" | {r['tail_us']:.1f} ({r['tail_mb']:.2f}) | "
+            + " ".join(f"{x:.0f}" for x in r["tenths_gbs"])
+            + f" | {'' if r['valid'] else '**INVALID** '}{r['overrun_max_us']:.1f} / {r['overrun_median_us']:.1f},"
+            f" {r['cores_overrun_gt0']}, {r['pushes_max']} |"
         )
     (args.cell / "dram_timeline.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))

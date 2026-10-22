@@ -6,7 +6,7 @@ NoC transfer of every op in npe_viz/). Read rates come from the MEASURED issue t
 link demand is its congestion MODEL over the same transfers.
 
   fig15  per-core DRAM read rate on the physical grid: gate_proj while all 64 cores read and its per-core peak,
-         gate_proj read in 16 blocks instead of 4, down_proj (32 cores), lm_head (110 cores)
+         gate_proj read in 16 blocks instead of 4, down_proj (32 cores), global-layer qkv (48 cores)
   fig16  tt-npe's modelled demand per NoC link for the same gate_proj: map of the busiest link at each router,
          and over time the grid average against the busiest link
 
@@ -130,13 +130,13 @@ def fig15(out):
     gate, ends = dram_reads(npeviz(A0, "gate_proj (sliding)", 0))
     gate2, _ = dram_reads(npeviz(W2, "gate_proj (sliding)", 0))
     down, ends_d = dram_reads(npeviz(A0, "down_proj (sliding)", 0))
-    head, ends_h = dram_reads(npeviz(A0, "lm_head (whole, DRAM)"))
+    q48, ends_q = dram_reads(npeviz(A0, "qkv_proj (global)"))
     panels = [
         (per_core_rate(gate, 0, 20), ends, "gate_proj, 64 cores: first 20 us, all cores reading"),
         (per_core_rate_alive(gate, 32, 44), ends, "gate_proj: 32-44 us, after rows 7-9 finished"),
         (per_core_rate(gate2), ends, "gate_proj read in 16 blocks instead of 4"),
         (per_core_rate(down), ends_d, "down_proj, 32 cores"),
-        (per_core_rate(head), ends_h, "lm_head, 110 cores"),
+        (per_core_rate(q48, 0, 20), ends_q, "global-layer qkv, 48 cores: 0-20 us"),
     ]
     vmax = 12.0
     fig, axs = plt.subplots(2, 3, figsize=(16, 8.6))
@@ -161,15 +161,15 @@ cores the matmul does not use.
   other instead of 21-53 us. The matmul is about 9% faster.
 - down_proj (bottom left): 32 cores, each reading its whole weight column from one DRAM bank, all at
   8.3-9.0 GB/s, in step with each other; about 270 GB/s in total.
-- lm_head (bottom middle): 110 cores at 3.4 GB/s each, uniformly. Each core needs so little that
-  none of them is the limit; the DRAM itself is (about 400 GB/s in total).
+- global-layer qkv (bottom middle): 48 cores in their first 20 us, before any of them has finished.
+  The same row-dependent share as gate_proj: the lower rows get about twice the rate of the upper rows,
+  about 384 GB/s in total.
 
 Rates are issued bytes per second from a per-transfer trace of one profiled run. They are effective
 rates (bytes issued over time, including each core's waits), not a direct measurement of DRAM
 bandwidth. Tracing slows some
 matmuls (down_proj by about 24%), so the absolute values here are lower than in untraced runs; the
-pattern is what the figure shows. The lm_head trace's timestamps run about 7% long, so its values are
-about 7% low.
+pattern is what the figure shows.
 """
     save(fig, out, "fig15_dram_read_rate_grid", desc)
 
