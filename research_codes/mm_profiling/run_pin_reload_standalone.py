@@ -107,6 +107,24 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    m = re.search(r"\+sl(ow\d+|osw\d+|iw\d+|fid\w+|ring)$", arm)
+    if m:
+        # lm_head L1 slice config (record §9.2b C4): ow / osw class C; iw / fid / ring class A / B, mechanism only
+        base, extra, width = arm_spec(arm[: m.start()])
+        v = m.group(1)
+        key = {"ow": "GEMMA4_LMHEAD_L1_OBW", "osw": "GEMMA4_LMHEAD_L1_OSW", "iw": "GEMMA4_LMHEAD_L1_IW"}
+        if v == "ring":
+            return base, {**extra, "GEMMA4_LMHEAD_L1_GATHER": "1"}, width
+        if v.startswith("fid"):
+            return base, {**extra, "GEMMA4_LMHEAD_L1_FIDELITY": v[3:]}, width
+        k = "osw" if v.startswith("osw") else v[:2]
+        return base, {**extra, key[k]: v[len(k) :]}, width
+    m = re.search(r"\+headiw(\d+)$", arm)
+    if m:
+        # in0_block_w of the explicit-config lm_head calls (GEMMA4_LMHEAD_DRAFT_IW; record §9.2a C1). Reblocks the K
+        # sum: class A, mechanism only
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "GEMMA4_LMHEAD_DRAFT_IW": m.group(1)}, width
     m = re.search(r"\+niusample(\d*)$", arm)
     if m:
         # sample the 1D-mcast in1 reader's NIU read-word counter per block, and with a number every that many

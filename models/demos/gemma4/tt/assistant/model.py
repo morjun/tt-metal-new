@@ -357,11 +357,25 @@ class Gemma4AssistantModel:
         # and which the packer adds into a bf16 L1 partial (tt-metal-concepts.md §1.10).
         kt = k // T
         blk = 2 if kt % 2 == 0 else 1
+        # RESEARCH (gemma4-12b record §9.2b C4), all unset by default. GEMMA4_LMHEAD_L1_OBW / _OSW: out_block_w /
+        # out_subblock_w of the slice (class C: output tiling only). GEMMA4_LMHEAD_L1_IW: in0_block_w and
+        # GEMMA4_LMHEAD_L1_FIDELITY: LoFi / HiFi2 / HiFi3 / HiFi4 (class A: they change the K sum / the products).
+        obw = int(os.getenv("GEMMA4_LMHEAD_L1_OBW") or pc.per_core_N)
+        osw = int(os.getenv("GEMMA4_LMHEAD_L1_OSW") or 1)
+        blk = int(os.getenv("GEMMA4_LMHEAD_L1_IW") or blk)
+        fidelity = getattr(ttnn.MathFidelity, os.getenv("GEMMA4_LMHEAD_L1_FIDELITY") or "HiFi2")
+        if pc.per_core_N % obw or obw % osw or osw > 8 or kt % blk:
+            raise ValueError(
+                f"lm_head slice config: per_core_N={pc.per_core_N} out_block_w={obw} out_subblock_w={osw} "
+                f"in0_block_w={blk} (Kt={kt}) is not legal"
+            )
         pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=pc.compute_with_storage_grid_size,
             in0_block_w=blk,
             out_subblock_h=1,
-            out_subblock_w=1,
+            out_subblock_w=osw,
+            out_block_h=1,
+            out_block_w=obw,
             per_core_M=1,
             per_core_N=pc.per_core_N,
             fuse_batch=True,
@@ -369,13 +383,14 @@ class Gemma4AssistantModel:
             mcast_in0=True,
         )
         ckc = ttnn.init_device_compute_kernel_config(
-            mesh_device.arch(), math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=False, packer_l1_acc=True
+            mesh_device.arch(), math_fidelity=fidelity, fp32_dest_acc_en=False, packer_l1_acc=True
         )
         per_core_n = pc.per_core_N
         charge = k * T * per_core_n * self.lm_head.element_size()
         logger.info(
             f"[lm_head-split] pinning {cols}/{vocab} cols ({cols/vocab*100:.1f}%) on "
             f"{grid.x}x{grid.y}={cores} cores, per_core_N={per_core_n}, in0_block_w={pc.in0_block_w}, "
+            f"out_block_w={pc.out_block_w}, out_subblock_w={pc.out_subblock_w}, fidelity={fidelity}, "
             f"charge={charge} B/bank ({charge/1024:.0f} KiB)"
         )
         head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])

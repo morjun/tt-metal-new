@@ -559,9 +559,17 @@ def lm_head_out_block_w_config(env_name, x, w):
         per_core_n = int(pcn_raw)
     if per_core_n % out_block_w:
         raise ValueError(f"{env_name}={out_block_w} must divide per_core_N={per_core_n} (N={n}, {cores} cores)")
+    in0_block_w = 2 if (k // T) % 2 == 0 else 1
+    # RESEARCH (gemma4-12b record §9.2a, C1): e.g. GEMMA4_LMHEAD_DRAFT_IW overrides in0_block_w. It reblocks the K sum,
+    # so the logits are NOT bit-identical to the automatic config; for mechanism tests only.
+    iw_raw = (os.getenv(env_name.replace("_OBW", "_IW")) or "").strip()
+    if iw_raw:
+        in0_block_w = int(iw_raw)
+        if (k // T) % in0_block_w:
+            raise ValueError(f"{env_name.replace('_OBW', '_IW')}={iw_raw} must divide Kt={k // T}")
     pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
-        in0_block_w=2 if (k // T) % 2 == 0 else 1,
+        in0_block_w=in0_block_w,
         out_subblock_h=1,
         out_subblock_w=max(d for d in range(1, 9) if out_block_w % d == 0),
         out_block_h=1,
@@ -579,5 +587,7 @@ def lm_head_out_block_w_config(env_name, x, w):
         fp32_dest_acc_en=False,
         packer_l1_acc=True,
     )
-    logger.info(f"[lm-head-obw] {env_name}: N={n} per_core_N={per_core_n} out_block_w={out_block_w}")
+    logger.info(
+        f"[lm-head-obw] {env_name}: N={n} per_core_N={per_core_n} out_block_w={out_block_w} in0_block_w={in0_block_w}"
+    )
     return pc, ckc

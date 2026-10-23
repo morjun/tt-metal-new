@@ -69,8 +69,11 @@ def main():
     ops.sort()
     starts = [o[0] for o in ops]
     per_call = defaultdict(lambda: defaultdict(list))  # op index -> core -> [(cycle, counter)]
+    tol = 2.0 * MHZ  # a core's first sample can precede the op's FW start by clock skew between cores
     for t, core, words in samples:
-        i = bisect.bisect_right(starts, t) - 1
+        i = bisect.bisect_right(starts, t + tol) - 1
+        if i > 0 and t <= ops[i - 1][1]:
+            i -= 1  # still inside the previous op
         if i >= 0 and t <= ops[i][1]:
             per_call[i][core].append((t, words))
     per_label = defaultdict(list)

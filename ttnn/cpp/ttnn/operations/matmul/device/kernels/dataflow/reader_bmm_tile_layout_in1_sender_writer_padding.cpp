@@ -17,6 +17,11 @@
 // RESEARCH (gemma4-12b record §9.2, item 6b): MM_IN1_NIU_SAMPLE = 1 samples the NIU read-word counter per block;
 // N > 1 also samples it every N wall-clock ticks while a block's reads are issued and awaited. The counter counts
 // words that have ARRIVED, so a sample needs no barrier and the read pipeline is unchanged.
+// Per-block samples are decimated to at most MM_IN1_NIU_MAX_SAMPLES per op (every k-th block, always the last), so a
+// long op such as the lm_head (240 blocks at in0_block_w 2) fits the per-op profiler buffer and is observed to its end.
+#ifndef MM_IN1_NIU_MAX_SAMPLES
+#define MM_IN1_NIU_MAX_SAMPLES 100
+#endif
 inline void niu_sample() {
     DeviceTimestampedData("IN1_NIU_RD_WORDS", NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_DATA_WORD_RECEIVED));
 }
@@ -284,6 +289,15 @@ void kernel_main() {
     constexpr uint32_t in1_batch_stride_bytes = in1_KtNt_per_batch * in1_single_tile_size_bytes;
 #endif  // IN1_DRAM_HEIGHT_SHARDED
 
+#ifdef MM_IN1_NIU_SAMPLE
+    // RESEARCH (gemma4-12b record §9.2, item 6b): one sample before the first block, then after every k-th block.
+    constexpr uint32_t niu_total_blocks =
+        batch * batchB_lim * num_blocks_h_dim * num_blocks_w_dim * num_blocks_inner_dim;
+    constexpr uint32_t niu_stride = (niu_total_blocks + MM_IN1_NIU_MAX_SAMPLES - 1) / MM_IN1_NIU_MAX_SAMPLES;
+    uint32_t niu_block = 0;
+    niu_sample();
+    uint32_t niu_due = get_timestamp_32b() + MM_IN1_NIU_SAMPLE;
+#endif
     for (uint32_t b = 0; b < batch; ++b) {
         uint32_t in1_batch_tile_id = in1_tensor_start_tile_id;
 
@@ -326,14 +340,6 @@ void kernel_main() {
                     uint32_t l1_read_addr_in1_offset = 0;
 #endif  // IN1_DRAM_WIDTH_SHARDED
 
-#ifdef MM_IN1_NIU_SAMPLE
-                    // RESEARCH (gemma4-12b record §9.2, item 6b): this core's NIU master counter of read data words
-                    // received on this RISC's NoC, with a timestamp. Sampled once before the first block and after
-                    // every block's read barrier, it gives the DELIVERED (completion-time) read rate per core,
-                    // independent of op time and of the NoC trace's issue times.
-                    niu_sample();
-                    uint32_t niu_due = get_timestamp_32b() + MM_IN1_NIU_SAMPLE;
-#endif
                     for (uint32_t block = 0; block < num_blocks_inner_dim; ++block) {
                         if constexpr (fuse_op_all_gather) {
                             fused_op_receiver.update_current_block_start_tile_id(
@@ -469,10 +475,12 @@ void kernel_main() {
                         noc.async_read_barrier();
 #ifdef MM_IN1_NIU_SAMPLE
                         // RESEARCH (gemma4-12b record §9.2, item 6b): this core's NIU master counter of read data words
-                        // received on this RISC's NoC, with a timestamp, after every block's read barrier: the
+                        // received on this RISC's NoC, with a timestamp, after every k-th block's read barrier: the
                         // DELIVERED (completion-time) read rate per core, independent of op time and of the NoC
                         // trace's issue times.
-                        niu_sample();
+                        if (++niu_block % niu_stride == 0 || niu_block == niu_total_blocks) {
+                            niu_sample();
+                        }
 #endif
 #endif  // IN1_DRAM_WIDTH_SHARDED / IN1_DRAM_HEIGHT_SHARDED / IN1_SHARDED
 
