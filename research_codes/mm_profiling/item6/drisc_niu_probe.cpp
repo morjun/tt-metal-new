@@ -4,10 +4,10 @@
 // gemma4-12b record §9.2, item 6b, DRAM side: resident DRISC probe of this DRAM endpoint's NIU slave counters, the
 // DRAM-side half of a direct per-bank read-bandwidth measurement (test_drisc_niu_probe.py).
 //
-// Measured 2026-10-22: of the two DRISC senders per bank, one sees every Tensix DRAM read that arrives on NOC1 (its
-// NOC1 RD_DATA_WORD_SENT counts exactly the bytes in 64 B words) and the other sees none. No DRISC endpoint sees
-// reads on NOC0 on either counter, so the 1D-mcast in1 reader (NOC0) is visible only with the NoC swap
-// (TT_MM1D_MCAST_IN0_SWAP_NOCS), which moves it to NOC1.
+// Scope: it runs on the 16 DRISC senders Metal exposes, two of each bank's three DRAM endpoints: the NOC1 endpoint and
+// the one that serves neither NoC. The NOC0 endpoint, which serves the 1D-mcast in1 reader, is owned by syseng
+// firmware and runs no DRISC firmware (tt_metal/llrt/metal_soc_descriptor.hpp:47-53), so it is never sampled here and
+// no conclusion about NOC0 reads follows from this probe. Record §9.2 uses no result of it.
 //
 // Launched once (ttnn experimental launch_resident_drisc_kernel), outside the command queue. Waits on stream
 // GO_STREAM's counter, which drisc_reload_trigger.cpp raises (an inline write over NOC0 adds the command value):

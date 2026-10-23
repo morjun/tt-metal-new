@@ -10,7 +10,8 @@ on NOC1, the delivered rate while it serves reads. Run it on the overlay build (
     TT_METAL_RUNTIME_ROOT=$PWD TT_METAL_HOME=$PWD PYTHONPATH=/tmp/lmhead_ttnn_overlay_e2e:$PWD TT_VISIBLE_DEVICES=0 \
         pytest -q -s research_codes/mm_profiling/item6/test_drisc_niu_probe.py
 
-With TT_MM1D_MCAST_IN0_SWAP_NOCS=1 the weight reads move to NOC1, where the DRISC endpoints see them.
+Scope: the DRISC senders are each bank's NOC1 endpoint and its unused endpoint; the NOC0 endpoint (syseng-owned, no
+DRISC firmware) is not among them, so reads on NOC0 are never observed. Record §9.2 uses no result of this test.
 """
 
 import time
