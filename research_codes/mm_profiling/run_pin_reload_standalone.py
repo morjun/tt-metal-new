@@ -107,6 +107,11 @@ def arm_spec(arm):
         spec = [x for x in extra.get("GEMMA4_MM_BLOCK_CAP_SHAPES", "").split(";") if x]
         spec += [f"{k}x{n}={cap}" for k, n in BLK_GROUPS[group]]
         return base, {**extra, "GEMMA4_MM_BLOCK_CAP_SHAPES": ";".join(spec)}, width
+    if arm.endswith("+dramshard"):
+        # fat-K weights DRAM WIDTH_SHARDED, run as the DRAM-sharded matmul at the tuner's in0_block_w (record §9.2a;
+        # bit-identical in isolation, test_dram_sharded_fatk.py)
+        base, extra, width = arm_spec(arm[: -len("+dramshard")])
+        return base, {**extra, "GEMMA4_DRAM_SHARD": "pre_projection,o_proj,down_proj"}, width
     m = re.search(r"\+sl(ow\d+|osw\d+|iw\d+|fid\w+|ring)$", arm)
     if m:
         # lm_head L1 slice config (record §9.2b C4): ow / osw class C; iw / fid / ring class A / B, mechanism only

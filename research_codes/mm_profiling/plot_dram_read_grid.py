@@ -268,6 +268,115 @@ DRAM data enters it. This is a model of the recorded transfers, not a measuremen
     save(fig, out, "fig16_npe_link_demand", desc)
 
 
+def npe_link_means(d):
+    """Mean modelled demand per link over the matmul (% of the link's bandwidth), the busiest link into each
+    router, the time series, and the hottest link."""
+    ts = sorted(d["timestep_data"], key=lambda t: t["start_cycle"])
+    mean = defaultdict(float)
+    for t in ts:
+        for _, r, c, kind, dem in t["link_demand"]:
+            if kind in NPE_LINKS:
+                mean[(r, c, kind)] += dem / NPE_LINK_BW * 100 / len(ts)
+    busiest = {}
+    for (r, c, kind), v in mean.items():
+        dr, dc = NPE_LINKS[kind]
+        rc = ((r + dr) % ROWS, (c + dc) % COLS)
+        busiest[rc] = max(busiest.get(rc, 0.0), v)
+    hot = max(mean, key=mean.get)
+    us = np.array([t["start_cycle"] / MHZ for t in ts])
+    avg = np.array([t["avg_link_demand"] for t in ts])
+    hot_t = np.array(
+        [next((x[4] for x in t["link_demand"] if (x[1], x[2], x[3]) == hot), 0.0) / NPE_LINK_BW * 100 for t in ts]
+    )
+    return mean, busiest, hot, us, avg, hot_t
+
+
+def fig16b(out):
+    """fig16 for the NoC-swapped run: NoC0 (default) and NoC1 (in1 reader swapped) side by side, one scale."""
+    cells = CELLS.parent / "phase2_nocswap"
+    runs = [("NoC0 (default)", cells / "04_noc_B+logitsl1"), ("NoC1 (swapped)", cells / "05_noc_B+logitsl1+nocswap")]
+    data = []
+    for name, cell in runs:
+        d = npeviz(cell, "gate_proj (sliding)", 0)
+        _, ends = dram_reads(d)
+        data.append((name, ends) + npe_link_means(d))
+    k = 32
+
+    def smooth(y):
+        return np.convolve(y, np.ones(k) / k, mode="same")
+
+    def hot_label(hot):
+        r, c, kind = hot
+        dr, dc = NPE_LINKS[kind]
+        return f"row {r}, column {c} → row {r + dr}, column {c + dc}"
+
+    vmax = 400.0
+    fig = plt.figure(figsize=(18, 6.6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.95])
+    for i, (name, ends, mean, busiest, hot, us, avg, hot_t) in enumerate(data):
+        ax = fig.add_subplot(gs[i])
+        grid(
+            ax,
+            {rc: v for rc, v in busiest.items() if rc[1] not in DRAM_COLS},
+            ORANGES,
+            vmax,
+            ends,
+            f"{name}: busiest link into each router",
+            fmt="{:.0f}",
+            fs=6.5,
+        )
+        # links that lead INTO a DRAM-column router (NoC1's northbound column links) are drawn on that router
+        for (r, c), v in busiest.items():
+            if c in DRAM_COLS and v >= 5:
+                ax.add_patch(Rectangle((c - 0.45, r - 0.45), 0.9, 0.9, color=ORANGES(min(v / vmax, 1.0)), lw=0))
+                ax.text(
+                    c,
+                    r,
+                    f"D\n{v:.0f}",
+                    ha="center",
+                    va="center",
+                    fontsize=5.5,
+                    color=SURFACE if v / vmax > 0.45 else INK,
+                )
+        colorbar(fig, ax, ORANGES, vmax, "modelled link demand, % of the link's bandwidth")
+    ax3 = fig.add_subplot(gs[2])
+    for (name, _, mean, _, hot, us, avg, hot_t), color in zip(data, (BLUE, ORANGE)):
+        ax3.plot(us, smooth(hot_t), color=color, lw=2, label=f"{name}, busiest link")
+        ax3.plot(us, smooth(avg), color=color, lw=1.3, ls=(0, (4, 2)), label=f"{name}, average over all links")
+    ax3.axhline(100, color=AXIS, lw=1, ls=(0, (1, 2)))
+    ax3.set_xlabel("time since the matmul started, us")
+    ax3.set_ylabel("modelled demand, % of the link's bandwidth")
+    ax3.set_ylim(0, 620)
+    ax3.legend(loc="upper right", fontsize=9, frameon=False)
+    ax3.set_title("Busiest link (solid) and average over all links (dashed)", fontsize=11)
+    (n0, _, m0, _, h0, *_), (n1, _, m1, _, h1, *_) = data
+    over0 = sum(1 for v in m0.values() if v > 100)
+    over1 = sum(1 for v in m1.values() if v > 100)
+    desc = f"""
+The congestion model's view (tt-npe) of the same weight-read matmul (gate_proj of a sliding-window layer,
+64 cores, weights read from DRAM) in two runs from one session: the default, where each core's weight
+reads travel on network 0, and a run with the two networks swapped, so the weight reads travel on network 1.
+Network 0 routes along the row first, then down the column; network 1 routes up the column first, then
+along the row. The model replays every recorded transfer in 32-cycle steps; a link's demand is the sum of
+the bandwidth every in-flight transfer routed through it tries to use, as a percentage of the link's
+bandwidth in the model. Both maps use the same colour scale.
+
+- Left, default: for every router, the busiest link leading into it, averaged over the matmul ("D" squares
+  with a number: links leading into a DRAM-column router). The hot
+  links leave the DRAM columns ("D"; dark = endpoints that served reads) eastwards along their rows.
+  Busiest: {hot_label(h0)}, {m0[h0]:.0f}% on average; {over0} links above 100%.
+- Middle, swapped: the responses now leave each bank northwards up its DRAM column, and the four banks
+  of a column share that column's vertical links. Busiest: {hot_label(h1)}, {m1[h1]:.0f}% on average;
+  {over1} links above 100%.
+- Right: over time, the busiest link of each run (solid) and the average over all links (dashed).
+
+With the networks swapped, every DRAM-fed matmul read its weights 30-44% slower in total (43-78% longer
+matmuls). This is a model of the
+recorded transfers, not a measurement of the links.
+"""
+    save(fig, out, "fig16b_npe_link_demand_noc_swap", desc)
+
+
 def fig17(out):
     a = GRIDWIDE / "06_noc_B+logitsl1"
     wide = GRIDWIDE / "07_noc_B+logitsl1+gridwide"
@@ -321,7 +430,7 @@ bandwidth. Tracing slows the matmuls a little, so the absolute values are lower 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default="fig15,fig16,fig17")
+    p.add_argument("--only", default="fig15,fig16,fig16b,fig17")
     args = p.parse_args()
     for name in args.only.split(","):
         globals()[name](args.out)

@@ -474,6 +474,8 @@ class DecodeMatmulTuner:
         call sites are unchanged. MEASURED with both reshards included, this is
         -58.3% on pre_projection and -32.0% on down_proj (arm e+).
         """
+        if kwargs.get("program_config") is None and self.enabled and self._dram_width_sharded(w):
+            return self._dram_sharded_linear(x, w, **kwargs)
         plan = self._gather_plan(x, w) if kwargs.get("program_config") is None else None
         if plan is not None:
             pc, in0_spec, out_spec = plan
@@ -494,6 +496,62 @@ class DecodeMatmulTuner:
                 if kwargs.get("compute_kernel_config") is None:
                     kwargs["compute_kernel_config"] = self.compute_config_for(x, w)
         return ttnn.linear(x, w, **kwargs)
+
+    @staticmethod
+    def _dram_width_sharded(w):
+        mc = w.memory_config()
+        return mc.buffer_type == ttnn.BufferType.DRAM and mc.memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+
+    def _dram_sharded_linear(self, x, w, **kwargs):
+        """RESEARCH (gemma4-12b record §9.2a, DRAM-sharded fat-K): a DRAM WIDTH_SHARDED weight (GEMMA4_DRAM_SHARD,
+        weight_placement.dram_shard_width) runs as MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig.
+
+        It keeps the 1D-multicast config's in0_block_w, so K is summed in the same blocks: measured bit-identical to
+        the 1D-multicast output on every fat-K shape (research_codes/mm_profiling/test_dram_sharded_fatk.py). in0 is
+        resharded to L1 WIDTH_SHARDED on the largest core count (<= 32, a row of up to 8 or whole rows of 8) that
+        divides Kt and Nt with a shard width that is a multiple of in0_block_w; the sharded output goes back to the
+        caller's memory config (DRAM interleaved by default).
+        """
+        T = ttnn.TILE_SIZE
+        k, n = int(x.shape[-1]), int(w.shape[-1])
+        key = ("dram_sharded", tuple(x.shape), tuple(w.shape))
+        if key not in self._cache:
+            mt, kt, nt = -(-int(x.shape[-2]) // T), k // T, n // T
+            iw = derive_decode_1d_config(int(x.shape[-2]), k, n, self._max_x, self._max_y).in0_block_w
+            cores = max(
+                c
+                for c in range(1, 33)
+                if (c <= 8 or c % 8 == 0) and kt % c == 0 and nt % c == 0 and (kt // c) % iw == 0
+            )
+            grid = ttnn.CoreRangeSet(
+                {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(min(cores, 8) - 1, -(-cores // 8) - 1))}
+            )
+
+            def width_sharded(width):
+                return ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(grid, [T * mt, width], ttnn.ShardOrientation.ROW_MAJOR),
+                )
+
+            pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+                in0_block_w=iw, per_core_M=mt, per_core_N=nt // cores, fused_activation=None
+            )
+            self._cache[key] = (pc, width_sharded(k // cores), width_sharded(n // cores))
+            logger.info(
+                f"[mm-tune:{self.label}] M={int(x.shape[-2])} K={k} N={n} -> DRAM_SHARDED in0 cores={cores}"
+                f" in0_block_w={iw} per_core_N={nt // cores}"
+            )
+        pc, in0_mc, out_mc = self._cache[key]
+        want_mc = kwargs.pop("memory_config", None) or ttnn.DRAM_MEMORY_CONFIG
+        if kwargs.get("compute_kernel_config") is None:
+            kwargs["compute_kernel_config"] = self.compute_config_for(x, w)
+        xs = ttnn.to_memory_config(x, in0_mc)
+        out = ttnn.linear(xs, w, program_config=pc, memory_config=out_mc, **kwargs)
+        xs.deallocate(True)
+        back = ttnn.sharded_to_interleaved(out, want_mc)
+        out.deallocate(True)
+        return back
 
     def compute_config_for(self, x, w):
         """Return the compute config ttnn would pick for this matmul without a program config.

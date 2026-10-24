@@ -447,7 +447,53 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None):
     return ttnn.to_memory_config(tensor, mc)
 
 
-def place_as_tensor(
+def _dram_shard_names():
+    """GEMMA4_DRAM_SHARD: comma list of weight-name substrings to store DRAM WIDTH_SHARDED (not the target)."""
+    raw = os.getenv("GEMMA4_DRAM_SHARD", "").strip()
+    return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+
+def dram_shard_width(tensor, device):
+    """RESEARCH (gemma4-12b record §9.2a, DRAM-sharded fat-K): re-lay a DRAM-interleaved [.., K, N] matmul weight as
+    DRAM WIDTH_SHARDED, one contiguous N / banks slice per DRAM bank, for
+    MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig (DecodeMatmulTuner.linear). Returns None if N does not
+    split into whole tiles per bank."""
+    k, n = int(tensor.shape[-2]), int(tensor.shape[-1])
+    banks = device.dram_grid_size().x
+    if n % (ttnn.TILE_SIZE * banks):
+        return None
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
+    mc = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.DRAM,
+        ttnn.ShardSpec(grid, [k, n // banks], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    return ttnn.to_memory_config(tensor, mc)
+
+
+def place_as_tensor(placement, name, torch_tensor, *, device, **kwargs):
+    """``_place_as_tensor``, then (research knob GEMMA4_DRAM_SHARD; every placement but the target's) a
+    DRAM-interleaved weight whose name matches is re-laid DRAM WIDTH_SHARDED."""
+    tensor = _place_as_tensor(placement, name, torch_tensor, device=device, **kwargs)
+    names = _dram_shard_names()
+    if (
+        names
+        and device is not None
+        and tensor is not None
+        and getattr(resolve(placement), "label", "") != "target"
+        and any(s in name for s in names)
+        and tensor.memory_config().buffer_type == ttnn.BufferType.DRAM
+        and tensor.memory_config().memory_layout == ttnn.TensorMemoryLayout.INTERLEAVED
+    ):
+        moved = dram_shard_width(tensor, device)
+        if moved is not None:
+            logger.info(f"[placement:{resolve(placement).label}] DRAM-sharded {name} {list(tensor.shape)}")
+            tensor.deallocate(True)
+            return moved
+    return tensor
+
+
+def _place_as_tensor(
     placement,
     name,
     torch_tensor,
