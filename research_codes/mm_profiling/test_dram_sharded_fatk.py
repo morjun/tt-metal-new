@@ -33,6 +33,14 @@ from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 INNER, REPLAYS = 20, 30
 T = 32
 SHAPES = [("o_proj (sliding)", 4096, 1024), ("pre_projection", 7680, 1024), ("down_proj / o_proj (global)", 8192, 1024)]
+# thin-K (DSH_SET=thin): K 1024; "bW" adds W's wide-grid 1D-multicast config (GEMMA4_MM_GRID_SHAPES of +gridwide)
+THIN = [
+    ("qkv / gate / up (sliding)", 1024, 8192, 3),
+    ("qkv_proj (global)", 1024, 9216, 3),
+    ("post_projection", 1024, 3840, 2),
+]
+if __import__("os").getenv("DSH_SET") == "thin":
+    SHAPES = THIN
 ONLY = __import__("os").getenv("DSH_ONLY")  # e.g. "pre_projection": run one shape
 
 
@@ -80,7 +88,7 @@ def test_dram_sharded_fatk(mesh_device, reset_seeds):
     )
     banks = md.dram_grid_size().x
     dgrid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
-    for name, K, N in SHAPES:
+    for name, K, N, *wide in SHAPES:
         if ONLY and ONLY not in name:
             continue
         Kt, Nt = K // T, N // T
@@ -116,8 +124,36 @@ def test_dram_sharded_fatk(mesh_device, reset_seeds):
             f"[dsh] {name} K={K} N={N} b (1D mcast, {pc_b.compute_with_storage_grid_size.x}x{pc_b.compute_with_storage_grid_size.y},"
             f" iw{pc_b.in0_block_w}): {us_b:8.2f} us  pcc={_pcc(out_b, gold):.6f}"
         )
+        if wide:
+            # W's DRAM-fed config: the tuner's in0_block_w on the row-major prefix of ceil(Nt / pcN) cores of the full
+            # grid (matmul_tuning.py config_for, GEMMA4_MM_GRID_SHAPES branch)
+            full = md.compute_with_storage_grid_size()
+            pcn = wide[0]
+            cores_w = -(-Nt // pcn)
+            pc_w = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=ttnn.CoreCoord(min(cores_w, full.x), -(-cores_w // full.x)),
+                in0_block_w=pc_b.in0_block_w,
+                out_subblock_h=1,
+                out_subblock_w=1,
+                per_core_M=1,
+                per_core_N=pcn,
+                fuse_batch=True,
+                fused_activation=None,
+                mcast_in0=True,
+            )
+            us_bw, out_bw = _time(
+                md,
+                lambda: ttnn.linear(
+                    x_dram, w_il, program_config=pc_w, compute_kernel_config=ckc, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                ),
+            )
+            logger.info(
+                f"[dsh] {name} bW (1D mcast, {cores_w} cores, pcN {pcn}, iw{pc_b.in0_block_w}): {us_bw:8.2f} us"
+                f" ({us_bw / us_b - 1:+.1%} vs b)  bit-identical to b: {torch.equal(out_bw.to(torch.bfloat16), out_b.to(torch.bfloat16))}"
+            )
+            us_b, out_b = us_bw, out_bw  # f / f+ below are compared with W's config
 
-        for cores in (1, 2, 8, 16, 32):
+        for cores in [int(c) for c in __import__("os").getenv("DSH_CORES", "1,2,4,8,16,32").split(",")]:
             if Kt % cores or Nt % cores:
                 continue
             g = _grid(cores)
@@ -158,8 +194,8 @@ def test_dram_sharded_fatk(mesh_device, reset_seeds):
                 same = torch.equal(out_f.to(torch.bfloat16), out_b.to(torch.bfloat16))
                 diff = int((out_f.to(torch.bfloat16) != out_b.to(torch.bfloat16)).sum())
                 logger.info(
-                    f"[dsh] {name} f cores={cores} iw{iw}: {us_f:8.2f} us ({us_f / us_b - 1:+.1%} vs b)  f+ {us_fp:8.2f} us"
-                    f" ({us_fp / us_b - 1:+.1%} vs b)  bit-identical to b: {same} ({diff} of {out_b.numel()} differ)"
+                    f"[dsh] {name} f cores={cores} iw{iw}: {us_f:8.2f} us ({us_f / us_b - 1:+.1%} vs {'bW' if wide else 'b'})"
+                    f"  f+ {us_fp:8.2f} us ({us_fp / us_b - 1:+.1%} vs {'bW' if wide else 'b'})  bit-identical to b: {same} ({diff} of {out_b.numel()} differ)"
                     f"  pcc={_pcc(out_f, gold):.6f}"
                 )
             x_sh.deallocate(True)
