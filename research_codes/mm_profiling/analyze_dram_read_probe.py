@@ -169,7 +169,7 @@ def main():
     p.add_argument("--group", default="gate")
     a = p.parse_args()
     rows = json.loads((a.dir / f"{a.group}.json").read_text())
-    text = {"gate": gate, "e1": e1, "e2": e2}[a.group](rows)
+    text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2}[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)
 

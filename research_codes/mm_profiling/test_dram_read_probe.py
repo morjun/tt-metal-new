@@ -32,7 +32,8 @@ from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric
 from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
 KERNEL = "research_codes/mm_profiling/kernels/dram_read_probe.cpp"
-NARGS = 14
+NARGS = 21
+COORD = (10, 9)  # lockstep coordinator: outside every reader set used here
 TILE_BYTES = 2048
 MAX_BLOCKS = 64
 REC_BYTES = 4 * (4 + 4 * MAX_BLOCKS)
@@ -87,6 +88,11 @@ class Probe:
                 ttnn.Shape([1, 1, len(self.all), row_bytes // 4]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, dev, mc
             )
 
+        self.l1_mc = lambda row_bytes: ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(crs(self.all), [1, row_bytes // 4], ttnn.ShardOrientation.ROW_MAJOR),
+        )
         self.rec = l1(REC_BYTES)
         self.scratch = l1(SCRATCH_BYTES)
         # 64 MB bf16 tile tensor, DRAM interleaved: 32,768 pages of 2 KB, 4,096 per bank (8 MB per bank)
@@ -97,18 +103,39 @@ class Probe:
         self.pages = 8192 * 4096 // 1024
         logger.info(f"[probe] grid {g.x}x{g.y}; DRAM base {self.base:#x}; rec {self.rec.buffer_address():#x}")
 
-    def run(self, cfgs, depth=1, vc=1, noc=0):
-        """cfgs: {logical core: args}; returns {core: record dict}."""
+    def run(self, cfgs, depth=1, vc=1, noc=0, lockstep=False, runahead=2):
+        """cfgs: {logical core: args}; returns {core: record dict}. lockstep: readers coupled through a coordinator
+        at COORD (block b starts once every reader completed block b - runahead); depth 1, NoC0 only."""
+        sync = ttnn.from_torch(
+            torch.zeros(1, 1, len(self.all), 16, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.dev,
+            memory_config=self.l1_mc(64),
+        )
+        ls = [0] * 7
+        if lockstep:
+            assert depth == 1 and noc == 0 and COORD not in cfgs
+            v = [self._virt(xy) for xy in cfgs]
+            x0, y0, x1, y1 = min(a for a, _ in v), min(b for _, b in v), max(a for a, _ in v), max(b for _, b in v)
+            cx, cy = self._virt(COORD)
+            ls = [1, cx << 16 | cy, sync.buffer_address(), runahead, len(cfgs), x0 << 24 | y0 << 16 | x1 << 8 | y1]
+            ls.append(len(cfgs))
         rt = ttnn.RuntimeArgs()
+        n_blocks = max(c["n_blocks"] for c in cfgs.values())
         for x, y in self.all:
             c = cfgs.get((x, y))
+            if lockstep and (x, y) == COORD:
+                a = [1, 3, 0, n_blocks, 0, 0, 1, 1, 0, 0, 0, 0, 0, self.rec.buffer_address()]
+                rt[x][y] = a + ls
+                continue
             if c is None:
                 rt[x][y] = [0] * NARGS
                 continue
             assert c["n_blocks"] <= MAX_BLOCKS and c["req_bytes"] <= 16384
             a = [1, c["mode"], self.base, c["n_blocks"], c["reqs"], c["req_bytes"], c.get("depth", depth)]
             a += [c.get("vc", vc), *c["p"], self.scratch.buffer_address(), self.rec.buffer_address()]
-            rt[x][y] = a
+            rt[x][y] = a + ls
         k = ttnn.KernelDescriptor(
             kernel_source=KERNEL,
             source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
@@ -121,7 +148,17 @@ class Probe:
         )
         ttnn.generic_op([self.rec, self.rec], ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[]))
         ttnn.synchronize_device(self.dev)
+        sw = ttnn.to_torch(sync).view(torch.int32).reshape(len(self.all), -1).numpy().astype("uint32")
+        sync.deallocate(True)
         words = ttnn.to_torch(self.rec).view(torch.int32).reshape(len(self.all), -1).numpy().astype("uint32")
+        if lockstep and words[self.all.index(COORD)][3]:
+            logger.info(
+                f"[probe] lockstep sync words: coordinator {sw[self.all.index(COORD)][[0, 4, 8]].tolist()}, readers "
+                f"{[(xy, sw[self.all.index(xy)][[0, 4, 8]].tolist(), int(words[self.all.index(xy)][3])) for xy in list(cfgs)[:4]]}"
+                f"; args {ls}"
+            )
+        if lockstep:
+            assert not words[self.all.index(COORD)][3], "lockstep coordinator wait timed out"
         out = {}
         for i, xy in enumerate(self.all):
             if xy not in cfgs:
@@ -130,6 +167,7 @@ class Probe:
             n = int(w[0])
             blocks = w[4 : 4 + 4 * n].reshape(n, 4)
             c = cfgs[xy]
+            assert not w[3], f"lockstep wait timed out on {xy}"
             out[xy] = dict(
                 t_start=int(w[1]),
                 t_end=int(w[2]),
@@ -219,6 +257,13 @@ def group_configs(p):
             out.append((f"fat_{xy[0]}_{xy[1]}", {xy: strip_args(32, 0, 1, 0, 32, 8)}, 1, 1, 0))
             out.append((f"thin_{xy[0]}_{xy[1]}", {xy: strip_args(256, 0, 4, 0, 16, 8)}, 1, 1, 0))
         return out
+    if GROUP == "ls_debug":
+        return [("dbg2", {(0, 0): strip_args(32, 0, 1, 0, 4, 8), (1, 0): strip_args(32, 1, 1, 0, 4, 8)}, 1, 1, 0, True)]
+    if GROUP == "gate_ls":
+        # gate (a') / (b'): the gate's (a) and (b) configs with the lockstep coupling, run-ahead 2
+        fat, _ = matmul_strips(8192, 1024)
+        thin, _ = matmul_strips(1024, 8192)
+        return [("a_fatK_down_32c_ls", fat, 1, 1, 0, True), ("b_thinK_gate_64c_ls", thin, 1, 1, 0, True)]
     if GROUP == "banks":
         # E0 per-bank service: down_proj strips of bank b (columns b + 8 y), 32 blocks of 8 tiles, depth 1;
         # (i) core (0, 0) alone; (ii) the gate's 4 cores (b, 0..3); (iii) cores (0, 0..3); (iv) (0, 0) bursts, depth 3
@@ -259,10 +304,11 @@ def test_dram_read_probe(mesh_device):
         (OUT / "clock.json").write_text(json.dumps(dict(ticks=dev_ticks, wall_s=wall)))
         return
     rows = []
-    for name, cfgs, depth, vc, noc in group_configs(p):
-        p.run(cfgs, depth, vc, noc)  # compile + warm
+    for name, cfgs, depth, vc, noc, *ls in group_configs(p):
+        lockstep = bool(ls and ls[0])
+        p.run(cfgs, depth, vc, noc, lockstep)  # compile + warm
         for rep in range(REPEATS):
-            res = p.run(cfgs, depth, vc, noc)
+            res = p.run(cfgs, depth, vc, noc, lockstep)
             s = summarize(res)
             rows.append(
                 dict(
@@ -271,6 +317,7 @@ def test_dram_read_probe(mesh_device):
                     depth=depth,
                     vc=vc,
                     noc=noc,
+                    lockstep=lockstep,
                     cores={f"{x},{y}": dict(res[(x, y)], rate=s["rates"][(x, y)]) for x, y in res},
                     bulk=s["bulk"],
                     agg=s["agg"],

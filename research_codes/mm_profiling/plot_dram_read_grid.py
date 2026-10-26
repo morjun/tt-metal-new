@@ -36,8 +36,9 @@ BLUES = LinearSegmentedColormap.from_list("b", ["#cde2fb", "#86b6ef", "#3987e5",
 ORANGES = LinearSegmentedColormap.from_list("o", ["#fbe3d6", "#f5b394", "#eb6834", "#b8461c", "#7a2c10"])
 
 
-def npeviz(cell, label, layer=None, nth=0):
-    """The complete (unsplit) tt-npe file of the nth call of a labelled matmul."""
+def npeviz(cell, label, layer=None, nth=0, viz="npe_viz"):
+    """The complete (unsplit) tt-npe file of the nth call of a labelled matmul (viz: the cell's npe_viz, or
+    npe_sizefix.py's sizefix/fixed/npe_viz)."""
     (session,) = load(cell / "ops_perf.csv").values()
     calls = [
         int(o["row"]["GLOBAL CALL COUNT"]) // 1024
@@ -46,7 +47,7 @@ def npeviz(cell, label, layer=None, nth=0):
     ]
     (f,) = [
         f
-        for f in (cell / "npe_viz").glob(f"MatmulDeviceOperation_ID{calls[nth]}_traceID*.npeviz.zst")
+        for f in (cell / viz).glob(f"MatmulDeviceOperation_ID{calls[nth]}_traceID*.npeviz.zst")
         if "_split_" not in f.name
     ]
     return json.loads(subprocess.run(["zstd", "-dc", str(f)], capture_output=True, check=True).stdout)
@@ -291,6 +292,143 @@ def npe_link_means(d):
     return mean, busiest, hot, us, avg, hot_t
 
 
+def npe_panel(fig, ax, busiest, ends, vmax, title):
+    """Busiest modelled link into each router; links into a DRAM-column router are drawn on its "D" square."""
+    grid(
+        ax,
+        {rc: v for rc, v in busiest.items() if rc[1] not in DRAM_COLS},
+        ORANGES,
+        vmax,
+        ends,
+        title,
+        fmt="{:.0f}",
+        fs=6.5,
+    )
+    for (r, c), v in busiest.items():
+        if c in DRAM_COLS and v >= 5:
+            ax.add_patch(Rectangle((c - 0.45, r - 0.45), 0.9, 0.9, color=ORANGES(min(v / vmax, 1.0)), lw=0))
+            ax.text(
+                c, r, f"D\n{v:.0f}", ha="center", va="center", fontsize=5.5, color=SURFACE if v / vmax > 0.45 else INK
+            )
+
+
+T2 = CELLS.parent / "t2_noc"  # plan v2 T2 cells: W, W + fatk_dram_ring, W + dramshard
+
+
+def fig18(out):
+    """fat-K down_proj L0 under three deliveries on W: per-core read rate (top) and tt-npe link demand (bottom)."""
+    runs = [
+        ("DRAM interleaved, 1D multicast", T2 / "00_noc_B+logitsl1+gridwide+vc1"),
+        ("DRAM interleaved, gather_in0 ring", T2 / "01_noc_B+logitsl1+gridwide+vc1+fatk_dram_ring"),
+        # its 16 KB reads are recorded as 8,160 B (NoC trace size field); npe_sizefix.py restored them and re-ran tt-npe
+        ("DRAM-sharded (8 bank workers)", T2 / "02_noc_B+logitsl1+gridwide+vc1+dramshard", "sizefix/fixed/npe_viz"),
+    ]
+    data = []
+    for name, cell, *viz in runs:
+        d = npeviz(cell, "down_proj (sliding)", 0, viz=viz[0] if viz else "npe_viz")
+        reads, ends = dram_reads(d)
+        mean, busiest, hot, *_ = npe_link_means(d)
+        data.append((name, reads, ends, mean, busiest, hot))
+    rate_max = max(max(per_core_rate(r).values()) for _, r, *_ in data)
+    vmax_rate = float(np.ceil(rate_max / 10) * 10)
+    vmax_npe = 250.0
+    fig, axs = plt.subplots(2, 3, figsize=(18, 10.2))
+    for i, (name, reads, ends, mean, busiest, hot) in enumerate(data):
+        rate = per_core_rate(reads)
+        total = sum(n for _, n, _ in reads) / (max(t for t, _, _ in reads) - min(t for t, _, _ in reads)) / 1e3
+        grid(axs[0, i], rate, BLUES, vmax_rate, ends, f"{name}\n{len(rate)} reading cores, {total:.0f} GB/s issued")
+        npe_panel(
+            fig, axs[1, i], busiest, ends, vmax_npe, f"{name}\nbusiest link into each router; hottest {mean[hot]:.0f}%"
+        )
+    colorbar(
+        fig,
+        axs[0, :].tolist(),
+        BLUES,
+        vmax_rate,
+        "DRAM read rate per reading core, GB/s (issued weight bytes per second)",
+    )
+    colorbar(fig, axs[1, :].tolist(), ORANGES, vmax_npe, "modelled link demand, % of the link's bandwidth")
+    desc = """
+One down-projection matmul of the drafter (8192 x 1024 weight, read from DRAM) under three ways of
+delivering the weight, on the same chip configuration. Top row: each square is a compute core that reads
+weights, labelled with how fast it pulled them from DRAM (GB/s, issued bytes over that core's own reading
+time); "D" squares are the DRAM columns, the dark ones the endpoints that served the reads. Bottom row:
+the network-on-chip congestion model's (tt-npe) busiest link into each router, averaged over the matmul,
+as a percentage of the link's bandwidth; links into a DRAM-column router are drawn on its "D" square.
+
+- Left, interleaved weight, activation multicast (the default): 32 cores each read one column of tiles,
+  all at 8.4-8.6 GB/s. The multicast keeps every core within a couple of blocks of the slowest one, so
+  they all move at one pace.
+- Middle, interleaved weight, activation passed around a ring: the same 32 readers, no longer held
+  together. Their rates spread from 9.2 to 17.5 GB/s by column, the column reading the first DRAM bank
+  being the slowest.
+- Right, weight sharded across the 8 DRAM banks: 8 cores, one next to each bank, each reading its bank's
+  contiguous slice in large bursts at 52-53 GB/s, with far less load on the busiest links.
+
+The trace records any transfer above 8,160 bytes as 8,160 bytes; the sharded reads (16 KB bursts) were
+restored to their true size before the model was run on them. Rates are issued bytes per second from a
+per-transfer trace of one profiled run (profiling slows the matmuls), not a direct measurement of DRAM
+bandwidth; the link demand is a model of the recorded transfers, not a measurement.
+"""
+    save(fig, out, "fig18_fatk_delivery_read_rate_and_links", desc)
+
+
+def fig19(out):
+    """thin-K gate_proj L0: tt-npe busiest-link grids at 64 cores, 86 cores, and 86 cores + VC by row (W)."""
+    cells = CELLS.parent / "phase2_vc"
+    runs = [
+        ("64 cores", cells / "08_noc_B+logitsl1"),
+        ("86 cores", cells / "10_noc_B+logitsl1+gridwide"),
+        ("86 cores, VC by row", cells / "11_noc_B+logitsl1+gridwide+vc1"),
+    ]
+    data = []
+    for name, cell in runs:
+        d = npeviz(cell, "gate_proj (sliding)", 0)
+        _, ends = dram_reads(d)
+        data.append((name, ends) + npe_link_means(d))
+    k = 32
+
+    def smooth(y):
+        return np.convolve(y, np.ones(k) / k, mode="same")
+
+    vmax = 250.0
+    fig = plt.figure(figsize=(23, 7.4))
+    gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 1.0], wspace=0.25)
+    for i, (name, ends, mean, busiest, hot, us, avg, hot_t) in enumerate(data):
+        ax = fig.add_subplot(gs[i])
+        over = sum(1 for v in mean.values() if v > 100)
+        npe_panel(fig, ax, busiest, ends, vmax, f"{name}\nbusiest link {mean[hot]:.0f}%, {over} links above 100%")
+        colorbar(fig, ax, ORANGES, vmax, "modelled link demand, % of the link's bandwidth")
+    ax4 = fig.add_subplot(gs[3])
+    for (name, _, mean, _, hot, us, avg, hot_t), color in zip(data, (BLUE, ORANGE, INK2)):
+        ax4.plot(us, smooth(hot_t), color=color, lw=2, label=f"{name}, busiest link")
+        ax4.plot(us, smooth(avg), color=color, lw=1.2, ls=(0, (4, 2)), label=f"{name}, average over all links")
+    ax4.axhline(100, color=AXIS, lw=1, ls=(0, (1, 2)))
+    ax4.set_ylim(0, 320)
+    ax4.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2, fontsize=8.5, frameon=False)
+    ax4.set_xlabel("time since the matmul started, us")
+    ax4.set_ylabel("modelled demand, % of the link's bandwidth")
+    ax4.set_title("Busiest link (solid) and average over all links (dashed)", fontsize=11)
+    (_, _, m0, _, h0, *_), (_, _, m1, _, h1, *_), (_, _, m2, _, h2, *_) = data
+    desc = f"""
+The congestion model's view (tt-npe) of one gate-projection matmul of the drafter (1024 x 8192 weight,
+read from DRAM) on three grid layouts: the default 64 cores, the same weight spread over 86 cores, and
+86 cores with each row's read requests on its own virtual channel. Each map shows, for every router,
+the busiest link leading into it, averaged over the matmul, as a percentage of the link's bandwidth in
+the model; links into a DRAM-column router are drawn on its "D" square. All three maps use one scale.
+
+- 64 cores: the hottest link is {m0[h0]:.0f}% on average, {sum(1 for v in m0.values() if v > 100)} links above 100%.
+- 86 cores: {m1[h1]:.0f}%, {sum(1 for v in m1.values() if v > 100)} links above 100%. The extra cores in the right-hand columns
+  add traffic on new links, and the hottest link stays where it was.
+- 86 cores with a virtual channel per row: {m2[h2]:.0f}%, {sum(1 for v in m2.values() if v > 100)} links above 100%.
+
+Measured on the chip, the 86-core layout pulls weights faster than the 64-core one even though the
+model's hottest link does not get any less busy. This is a model of the recorded transfers, not a
+measurement of the links.
+"""
+    save(fig, out, "fig19_thin_k_grid_width_link_demand", desc)
+
+
 def fig16b(out):
     """fig16 for the NoC-swapped run: NoC0 (default) and NoC1 (in1 reader swapped) side by side, one scale."""
     cells = CELLS.parent / "phase2_nocswap"
@@ -430,7 +568,7 @@ bandwidth. Tracing slows the matmuls a little, so the absolute values are lower 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default="fig15,fig16,fig16b,fig17")
+    p.add_argument("--only", default="fig15,fig16,fig16b,fig17,fig18,fig19")
     args = p.parse_args()
     for name in args.only.split(","):
         globals()[name](args.out)
