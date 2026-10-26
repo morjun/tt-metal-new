@@ -137,6 +137,13 @@ def arm_spec(arm):
         # record §9.2 item 6b)
         base, extra, width = arm_spec(arm[: m.start()])
         return base, {**extra, "TT_MM1D_IN1_NIU_SAMPLE": m.group(1) or "1"}, width
+    m = re.search(r"\+vc(row|col|diag|bank|fix)([0-4])$", arm)
+    if m:
+        # VC sweep (plan v2 T3, record §9.2e): TT_MM1D_IN1_VC_MODE = kind * 16 + k; row / col / diag = logical
+        # y / x / x + y mod k, bank = the bank of the core's first in1 column mod k, fix = VC k for every core
+        base, extra, width = arm_spec(arm[: m.start()])
+        kind = {"row": 1, "col": 2, "diag": 3, "bank": 4, "fix": 5}[m.group(1)]
+        return base, {**extra, "TT_MM1D_IN1_VC_MODE": str(kind * 16 + int(m.group(2)))}, width
     m = re.search(r"\+vc([0-3])$", arm)
     if m:
         # per-core static VC of every 1D-mcast matmul's in1 read requests (TT_MM1D_IN1_VC_MODE; record §5.5.12 part 9,

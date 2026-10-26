@@ -220,13 +220,26 @@ void kernel_main() {
     // argument of noc_async_read is ignored, noc_nonblocking_api.h:489-493), so set it once here and
     // restore firmware's VC 1 at the end. 0 = untouched (control); 1 = logical y & 3; 2 = logical x & 3;
     // 3 = (x + y) & 3. Set by the factory from TT_MM1D_IN1_VC_MODE (gemma4-12b record §9.2).
+    // Values >= 16 (plan v2 T3 VC sweep, record §9.2e): kind = mode >> 4, k = mode & 15; kind 1 = y mod k,
+    // 2 = x mod k, 3 = (x + y) mod k, 4 = (bank of the core's first in1 column) mod k, 5 = fixed VC k. Unicast VCs 0-3.
 #ifndef MM_IN1_VC_MODE
 #define MM_IN1_VC_MODE 0
 #endif
 #if MM_IN1_VC_MODE != 0
+#if MM_IN1_VC_MODE < 16
     const uint32_t in1_rd_vc = MM_IN1_VC_MODE == 1   ? (get_absolute_logical_y() & 0x3u)
                                : MM_IN1_VC_MODE == 2 ? (get_absolute_logical_x() & 0x3u)
                                                      : ((get_absolute_logical_x() + get_absolute_logical_y()) & 0x3u);
+#else
+    constexpr uint32_t vc_kind = MM_IN1_VC_MODE >> 4;
+    constexpr uint32_t vc_k = MM_IN1_VC_MODE & 0xf;
+    static_assert(vc_kind >= 1 && vc_kind <= 5 && (vc_kind == 5 ? vc_k <= 3 : (vc_k >= 1 && vc_k <= 4)));
+    const uint32_t in1_rd_vc = vc_kind == 1   ? get_absolute_logical_y() % vc_k
+                               : vc_kind == 2 ? get_absolute_logical_x() % vc_k
+                               : vc_kind == 3 ? (get_absolute_logical_x() + get_absolute_logical_y()) % vc_k
+                               : vc_kind == 4 ? (in1_tensor_start_tile_id % 8) % vc_k
+                                              : vc_k;
+#endif
     while (!noc_cmd_buf_ready(noc_index, read_cmd_buf)) {
     }
     NOC_CMD_BUF_WRITE_REG(

@@ -41,6 +41,20 @@ FATK = ("pre_projection", "o_proj (sliding)", "o_proj (global)", "down_proj")
 VC_MODES = {"0": "default (VC 1 for all)", "1": "row mod 4", "2": "column mod 4", "3": "(row + column) mod 4"}
 
 
+def vc_mode_name(mode):
+    """TT_MM1D_IN1_VC_MODE -> words; >= 16 is the T3 sweep encoding (kind * 16 + k, the in1 reader's MM_IN1_VC_MODE)."""
+    if mode in VC_MODES:
+        return VC_MODES[mode]
+    kind, k = divmod(int(mode), 16)
+    return {
+        1: f"row mod {k}",
+        2: f"column mod {k}",
+        3: f"(row + column) mod {k}",
+        4: f"first-column bank mod {k}",
+        5: f"VC {k} for all",
+    }[kind]
+
+
 def pick_grid(nt, max_x=8, max_y=8):
     best = (1, 1)
     for gy in range(1, max_y + 1):
@@ -163,7 +177,7 @@ def knobs(arm):
         "backbone L1 pins": pin_txt,
         "lm_head": head,
         "head reload": reload,
-        "request VC": VC_MODES.get(env.get("TT_MM1D_IN1_VC_MODE", "0"), env.get("TT_MM1D_IN1_VC_MODE")),
+        "request VC": vc_mode_name(env.get("TT_MM1D_IN1_VC_MODE", "0")),
         "in1 NoC": "NoC1 (swapped)" if env.get("TT_MM1D_MCAST_IN0_SWAP_NOCS") else "NoC0",
         "logits": "L1" if env.get("GEMMA4_LMHEAD_LOGITS_L1") == "1" else "DRAM",
         "NIU sampler": env.get("TT_MM1D_IN1_NIU_SAMPLE", "off"),
