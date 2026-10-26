@@ -7,6 +7,7 @@ down_proj's shape (K 8192) on the production 1D-multicast matmul, per_core_N 1, 
              drafter's pattern, 8 KB stride within one bank)
   E2B_NT=33  N 1,056 (32 real + 1 padding column) on all 33 cores: column c of K row r lies in bank (33 r + c) mod 8,
              so each core's reads rotate over the 8 banks
+E2B_GRID=8x4 (E2c) runs Nt 32 on the tuner's 8 x 4 grid instead, to compare placements in one context.
 Eager, REPEATS calls after a warm-up, with the in1 reader's NIU sampler (TT_MM1D_IN1_NIU_SAMPLE=1, per block) and the
 device profiler on; run by e2b_nt33.sh under tracy, which keeps the sampler rows (niu_samples.csv) per arm.
 """
@@ -21,6 +22,7 @@ from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric
 
 K = 8192
 NT = int(os.getenv("E2B_NT", "32"))
+GRID = tuple(int(v) for v in os.getenv("E2B_GRID", "11x3").split("x"))  # E2c: "8x4" = the tuner's fat-K grid
 REPEATS = int(os.getenv("E2B_REPEATS", "5"))
 
 
@@ -49,7 +51,7 @@ def test_fatk_nt33(mesh_device):
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-        compute_with_storage_grid_size=ttnn.CoreCoord(11, 3),
+        compute_with_storage_grid_size=ttnn.CoreCoord(*GRID),
         in0_block_w=8,
         out_subblock_h=1,
         out_subblock_w=1,
@@ -64,4 +66,4 @@ def test_fatk_nt33(mesh_device):
         ttnn.synchronize_device(md)
         o.deallocate(True)
     ttnn.ReadDeviceProfiler(md)
-    logger.info(f"[e2b] Nt {NT}: {1 + REPEATS} calls (first = warm-up) on the 11 x 3 prefix")
+    logger.info(f"[e2b] Nt {NT}: {1 + REPEATS} calls (first = warm-up) on grid {GRID[0]} x {GRID[1]}")

@@ -29,8 +29,9 @@ MHZ, WORD = 1350.0, 64
 
 def run(order, out):
     out.mkdir(parents=True, exist_ok=True)
-    for i, nt in enumerate(order):
-        cell = out / f"{i:02d}_nt{nt}"
+    for i, arm in enumerate(order):
+        nt, _, grid = str(arm).partition("g")  # "32", "33" or "32g8x4" (E2c: Nt 32 on the 8 x 4 grid)
+        cell = out / f"{i:02d}_nt{arm}"
         cell.mkdir(exist_ok=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith("GEMMA4_")}
         env.update(
@@ -39,7 +40,8 @@ def run(order, out):
             PYTHONPATH=f"{OVERLAY}:{REPO}",
             TT_VISIBLE_DEVICES="0",
             TT_MM1D_IN1_NIU_SAMPLE="1",
-            E2B_NT=str(nt),
+            E2B_NT=nt,
+            E2B_GRID=grid or "11x3",
         )
         cmd = [
             "timeout",
@@ -97,11 +99,12 @@ def calls_of(path):
 
 def analyze(out):
     arms = defaultdict(list)
+    windows = defaultdict(list)  # per call: first core's first sample to last core's last sample, us
     detail = {}
     for cell in sorted(out.glob("*_nt*")):
         if not (cell / "niu_samples.csv").exists():
             continue
-        nt = int(cell.name.split("_nt")[1])
+        nt = cell.name.split("_nt")[1]
         per = calls_of(cell / "niu_samples.csv")
         ncalls = {len(c) for c in per.values()}
         assert len(ncalls) == 1, f"{cell.name}: cores disagree on call count {ncalls}"
@@ -115,13 +118,27 @@ def analyze(out):
                 rates[core] = (c[-1][1] - c[0][1]) * WORD / dt / 1e3 if dt > 0 else float("nan")
             med = statistics.median(rates.values())
             arms[nt].append(med)
+            window = (max(c[k][-1][0] for c in per.values()) - min(c[k][0][0] for c in per.values())) / MHZ
+            windows[nt].append(window)
             cell_rows.append(
-                dict(call=k, cores=len(rates), median=med, min=min(rates.values()), max=max(rates.values()))
+                dict(
+                    call=k,
+                    cores=len(rates),
+                    median=med,
+                    min=min(rates.values()),
+                    max=max(rates.values()),
+                    window_us=window,
+                )
             )
         detail[cell.name] = cell_rows
     summary = {}
     for nt, v in sorted(arms.items()):
-        summary[nt] = dict(n=len(v), mean=statistics.mean(v), sd=statistics.stdev(v) if len(v) > 1 else 0.0)
+        summary[nt] = dict(
+            n=len(v),
+            mean=statistics.mean(v),
+            sd=statistics.stdev(v) if len(v) > 1 else 0.0,
+            window_us=statistics.mean(windows[nt]),
+        )
     pooled = (
         (sum((s["n"] - 1) * s["sd"] ** 2 for s in summary.values()) / sum(s["n"] - 1 for s in summary.values())) ** 0.5
         if summary
@@ -130,10 +147,13 @@ def analyze(out):
     res = dict(summary=summary, pooled_sd=pooled, cells=detail)
     (out / "e2b.json").write_text(json.dumps(res, indent=1))
     for nt, s in summary.items():
-        print(f"Nt {nt}: per-core delivered median {s['mean']:.2f} GB/s (SD {s['sd']:.2f}, {s['n']} calls)")
-    if 32 in summary and 33 in summary:
-        d = summary[33]["mean"] - summary[32]["mean"]
-        print(f"Nt 33 - Nt 32: {d:+.2f} GB/s = {d / pooled:+.1f} pooled SD ({pooled:.3f})")
+        print(
+            f"Nt {nt}: per-core delivered median {s['mean']:.2f} GB/s (SD {s['sd']:.2f}, {s['n']} calls); read window {s['window_us']:.1f} us"
+        )
+    for x, y in (("33", "32"), ("32", "32g8x4")):
+        if x in summary and y in summary:
+            d = summary[x]["mean"] - summary[y]["mean"]
+            print(f"{x} - {y}: {d:+.2f} GB/s = {d / pooled:+.1f} pooled SD ({pooled:.3f})")
 
 
 def main():
@@ -145,7 +165,7 @@ def main():
     if a.analyze:
         analyze(a.analyze)
     else:
-        run([int(v) for v in a.order.split(",")], a.output)
+        run(a.order.split(","), a.output)
         analyze(a.output)
 
 
