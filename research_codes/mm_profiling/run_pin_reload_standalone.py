@@ -150,6 +150,13 @@ def arm_spec(arm):
         # §9.2): 1 = logical y & 3, 2 = logical x & 3, 3 = (x + y) & 3
         base, extra, width = arm_spec(arm[: m.start()])
         return base, {**extra, "TT_MM1D_IN1_VC_MODE": m.group(1)}, width
+    if arm.endswith("+gridfatk"):
+        # fat-K pre_projection / o_proj / down_proj on the 11-wide row-major prefix (32 cores, 11 + 11 + 10) instead
+        # of the tuner's 8 x 4 (GEMMA4_MM_GRID_SHAPES, pcN 1; record §9.2e E2c), appended to any existing override
+        base, extra, width = arm_spec(arm[: -len("+gridfatk")])
+        fatk = ";".join(f"{k}x1024=1" for k in (7680, 4096, 8192))
+        spec = ";".join(v for v in (extra.get("GEMMA4_MM_GRID_SHAPES"), fatk) if v)
+        return base, {**extra, "GEMMA4_MM_GRID_SHAPES": spec}, width
     if arm.endswith("+gridwide"):
         # DRAM-fed qkv / gate / up on 86 cores, global qkv on 96, post_projection on 60 (GEMMA4_MM_GRID_SHAPES)
         base, extra, width = arm_spec(arm[: -len("+gridwide")])
