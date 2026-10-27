@@ -460,12 +460,32 @@ void kernel_main() {
                             uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
                             for (uint32_t w = 0; w < in1_block_w; ++w) {
                                 if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
-                                    noc.async_read(
-                                        s1,
-                                        dfb_in1,
-                                        in1_single_tile_size_bytes,
-                                        {.page_id = in1_tensor_tile_id},
-                                        {.offset_bytes = in1_write_offset});
+#ifdef MM_IN1_BANK0_XY
+                                    // RESEARCH (gemma4-12b record §9.2e, plan v3 E6b arm iv): bank 0's tiles read
+                                    // through another of bank 0's three NoC endpoints (MM_IN1_BANK0_XY = translated
+                                    // x | y << 6), at the same bank offset as the interleaved accessor computes:
+                                    // base + (page / NUM_DRAM_BANKS) * page size + bank_to_dram_offset[0]. Same data,
+                                    // same order; only the endpoint (route) changes.
+                                    if (in1_tensor_tile_id % NUM_DRAM_BANKS == 0) {
+                                        noc_async_read(
+                                            NOC_XY_ADDR(
+                                                MM_IN1_BANK0_XY & 0x3f,
+                                                MM_IN1_BANK0_XY >> 6,
+                                                in1_tensor_addr +
+                                                    (in1_tensor_tile_id / NUM_DRAM_BANKS) *
+                                                        in1_aligned_tile_size_bytes +
+                                                    bank_to_dram_offset[0]),
+                                            dfb_in1.get_write_ptr() + in1_write_offset,
+                                            in1_single_tile_size_bytes,
+                                            noc_index);
+                                    } else
+#endif
+                                        noc.async_read(
+                                            s1,
+                                            dfb_in1,
+                                            in1_single_tile_size_bytes,
+                                            {.page_id = in1_tensor_tile_id},
+                                            {.offset_bytes = in1_write_offset});
 #ifdef MM_IN1_NIU_SAMPLE
                                     niu_sample_if_due(niu_due);
 #endif

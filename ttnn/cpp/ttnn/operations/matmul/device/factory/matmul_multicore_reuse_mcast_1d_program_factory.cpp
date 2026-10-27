@@ -588,6 +588,11 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     if (const char* vc_mode = std::getenv("TT_MM1D_IN1_VC_MODE"); vc_mode != nullptr) {
         mm_kernel_in1_sender_writer_defines["MM_IN1_VC_MODE"] = vc_mode;
     }
+    // RESEARCH (gemma4-12b record §9.2e, plan v3 E6b arm iv): read DRAM bank 0's in1 tiles through another of its
+    // NoC endpoints, given as translated x | y << 6 (e.g. 785 = (17, 12), physical (0, 0)).
+    if (const char* bank0_xy = std::getenv("TT_MM1D_IN1_BANK0_XY"); bank0_xy != nullptr) {
+        mm_kernel_in1_sender_writer_defines["MM_IN1_BANK0_XY"] = bank0_xy;
+    }
     // RESEARCH (gemma4-12b record §9.2, item 6b): sample the in1 reader's NIU read-word counter per block (1), and
     // every N wall-clock ticks (N > 1).
     if (const char* niu_sample = std::getenv("TT_MM1D_IN1_NIU_SAMPLE"); niu_sample != nullptr) {
@@ -3556,6 +3561,11 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     // requests (MM_IN1_VC_MODE in reader_bmm_tile_layout_in1_sender_writer_padding.cpp). Off unless the env var is set.
     if (const char* vc_mode = std::getenv("TT_MM1D_IN1_VC_MODE"); vc_mode != nullptr) {
         mm_kernel_in1_sender_writer_defines["MM_IN1_VC_MODE"] = vc_mode;
+    }
+    // RESEARCH (gemma4-12b record §9.2e, plan v3 E6b arm iv): read DRAM bank 0's in1 tiles through another of its
+    // NoC endpoints, given as translated x | y << 6 (e.g. 785 = (17, 12), physical (0, 0)).
+    if (const char* bank0_xy = std::getenv("TT_MM1D_IN1_BANK0_XY"); bank0_xy != nullptr) {
+        mm_kernel_in1_sender_writer_defines["MM_IN1_BANK0_XY"] = bank0_xy;
     }
     // RESEARCH (gemma4-12b record §9.2, item 6b): sample the in1 reader's NIU read-word counter per block (1), and
     // every N wall-clock ticks (N > 1).
