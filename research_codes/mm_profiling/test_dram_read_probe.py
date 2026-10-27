@@ -173,7 +173,7 @@ class Probe:
         sync_addr = sync.buffer_address()
         sender = min(cfgs, key=lambda xy: (xy[1], xy[0])) if paced else None
         n_blocks = max(c["n_blocks"] for c in cfgs.values())
-        remap = any("skip" in c or "redirect" in c for c in cfgs.values())  # compile-time: off = no per-request work
+        remap = any("skip" in c or "redirect" in c or "bank0_xy" in c for c in cfgs.values())  # compile-time
         rt = ttnn.RuntimeArgs()
         for x, y in self.all:
             c = cfgs.get((x, y))
@@ -186,6 +186,7 @@ class Probe:
             a = [1, c["mode"], self.base, c["n_blocks"], c["reqs"], c["req_bytes"], c.get("depth", depth)]
             a += [c.get("vc", vc), *c["p"], self.scratch.buffer_address(), self.rec.buffer_address()]
             a += [int(paced), sx << 16 | sy, sync_addr, c.get("skip", 0xFF), c.get("redirect", 0xFFFF)]
+            a += [c.get("bank0_xy", 0)]
             rt[x][y] = a + [0] * (NARGS - len(a))
         kernels = [
             ttnn.KernelDescriptor(
@@ -349,6 +350,21 @@ def group_configs(p):
             ("c_burst", burst, 3, 1, 0, False),
             ("a_off", fat, 1, 1, 0, False),
             ("b_off", thin, 1, 1, 0, False),
+        ]
+    if GROUP == "gate2_ep0":
+        # gate v2 (a) / (b) configs with bank 0 read through endpoint (0, 0) = translated (17, 12) (record §9.2e)
+        fat, _ = matmul_strips(8192, 1024)
+        thin, _ = matmul_strips(1024, 8192)
+        # both arms compile the same remap path (per-request work costs rate, changelog 51); only the endpoint differs
+        ep = lambda cf, xy: {k: dict(v, bank0_xy=xy) for k, v in cf.items()}  # noqa: E731
+        E0 = 17 | 12 << 6
+        return [
+            ("a_on", ep(fat, 0), 1, 1, 0, True),
+            ("a_on_ep0", ep(fat, E0), 1, 1, 0, True),
+            ("a_off", ep(fat, 0), 1, 1, 0, False),
+            ("a_off_ep0", ep(fat, E0), 1, 1, 0, False),
+            ("b_on", ep(thin, 0), 1, 1, 0, True),
+            ("b_on_ep0", ep(thin, E0), 1, 1, 0, True),
         ]
     if GROUP == "e1v3":
         out = []

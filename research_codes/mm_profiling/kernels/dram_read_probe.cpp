@@ -28,7 +28,9 @@
 //   18 redirect: src bank << 8 | dst bank (requests to src go to dst at the same bank offset); 0xffff: none
 //      17 / 18 act only with compile-time arg 0 bit 0 set: any per-request work in the issue loop slows a 2 KB
 //      stream (17 ns per request measured, 20.2 -> 17.1 GB/s for one core; plan v3 changelog 51)
-//   19..23 reserved (0)
+//   19 bank-0 endpoint override: translated x | y << 6 (0: the default endpoint); like the production knob
+//      TT_MM1D_IN1_BANK0_XY (record §9.2e E6b arm iv). Acts only with compile-time arg 0 bit 0 (remap)
+//   20..23 reserved (0)
 // sync words (16 B apart: a NoC write keeps the source's offset within 16 B): [0] consumed counter (on the sender),
 //   [4] in0-valid (on each reader, set by the sender's multicast), [8] the sender's multicast source
 // Records (uint32): [0] n_blocks, [1] t_start (before the first issue), [2] t_end (final barrier returned = last word
@@ -99,6 +101,7 @@ void kernel_main() {
     const uint32_t sync_addr = get_arg_val<uint32_t>(16);
     const uint32_t skip_bank = get_arg_val<uint32_t>(17);
     const uint32_t redirect = get_arg_val<uint32_t>(18);
+    const uint32_t bank0_xy = get_arg_val<uint32_t>(19);
     volatile tt_l1_ptr uint32_t* sync = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_addr);
     if (!enabled) {
         return;
@@ -147,19 +150,20 @@ void kernel_main() {
                 bank = (p1 + g % p0) % NUM_DRAM_BANKS_PROBE;
                 addr = base + p3 + (g / p0) * p2;
             }
+            uint64_t src = get_noc_addr_from_bank_id<true>(bank, addr, noc_index);
             if constexpr (kRemap) {
                 if (bank == skip_bank) {
                     continue;
                 }
                 if (bank == redirect_src) {
                     bank = redirect_dst;
+                    src = get_noc_addr_from_bank_id<true>(bank, addr, noc_index);
+                }
+                if (bank == 0 && bank0_xy) {
+                    src = NOC_XY_ADDR(bank0_xy & 0x3f, bank0_xy >> 6, addr + bank_to_dram_offset[0]);
                 }
             }
-            noc_async_read(
-                get_noc_addr_from_bank_id<true>(bank, addr, noc_index),
-                dst + (slot + i * req_bytes) % SCRATCH_BYTES,
-                req_bytes,
-                noc_index);
+            noc_async_read(src, dst + (slot + i * req_bytes) % SCRATCH_BYTES, req_bytes, noc_index);
         }
     };
     auto log_done = [&](uint32_t b) {
