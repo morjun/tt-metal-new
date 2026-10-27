@@ -366,6 +366,17 @@ def group_configs(p):
             ("b_on", ep(thin, 0), 1, 1, 0, True),
             ("b_on_ep0", ep(thin, E0), 1, 1, 0, True),
         ]
+    if GROUP == "p1_ep":
+        # P1 next limit (record §9.2e): bank 0 through each of its endpoints (0, 11) default, (0, 0), (0, 1), with the
+        # full fat-K load and with its 4 readers alone; bank 1's readers alone as the one-bank reference. Generator
+        # off; fat-K 8 x 4, so core (x, y) reads bank x. Every arm compiles the same remap path.
+        fat, _ = matmul_strips(8192, 1024)
+        ep = lambda cf, xy: {k: dict(v, bank0_xy=xy) for k, v in cf.items()}  # noqa: E731
+        only = lambda b: {k: v for k, v in fat.items() if k[0] == b}  # noqa: E731
+        out = []
+        for tag, xy in (("e11", 0), ("e00", 17 | 12 << 6), ("e01", 17 | 13 << 6)):
+            out += [(f"full_{tag}", ep(fat, xy), 1, 1, 0, False), (f"b0only_{tag}", ep(only(0), xy), 1, 1, 0, False)]
+        return out + [("b1only", ep(only(1), 0), 1, 1, 0, False)]
     if GROUP == "e1v3":
         out = []
         for xy in p.all:

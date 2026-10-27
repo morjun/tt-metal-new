@@ -312,6 +312,41 @@ def e2v3(rows, dup_rows=None):
     return "\n".join(out)
 
 
+def p1_ep(rows, dup_rows=None):
+    """P1 next limit: per config, each bank's summed per-core rate (fat-K 8 x 4: core "x,y" reads bank x) and the
+    op-time proxy, mean (SD) over repeats; pooled SD of the bank-0 sum. With a second process, its bank-0 sums."""
+    by = defaultdict(list)
+    for r in rows:
+        sums = defaultdict(float)
+        for k, c in r["cores"].items():
+            sums[int(k.split(",")[0])] += c["rate"]
+        by[r["name"]].append((dict(sums), r["op_us"]))
+    sd0 = pooled_sd([[s[0] for s, _ in v if 0 in s] for v in by.values()])
+    out = [
+        f"Pooled SD of the bank-0 sum: {sd0:.2f} GB/s.",
+        "",
+        "| config | bank sums GB/s, banks 0–7, mean (SD) | op µs |",
+        "|---|---|---|",
+    ]
+    for name, v in by.items():
+        banks = sorted({b for s, _ in v for b in s})
+        cells = []
+        for b in banks:
+            x = [s[b] for s, _ in v]
+            cells.append(f"{b}: {statistics.mean(x):.1f} ({statistics.stdev(x):.2f})")
+        ops = [o for _, o in v]
+        out.append(f"| {name} | {'; '.join(cells)} | {statistics.mean(ops):.1f} ({statistics.stdev(ops):.2f}) |")
+    if dup_rows:
+        d = defaultdict(list)
+        for r in dup_rows:
+            d[r["name"]].append(sum(c["rate"] for k, c in r["cores"].items() if k.split(",")[0] == "0"))
+        out += [
+            "",
+            "Second process, bank-0 sum mean: " + ", ".join(f"{k} {statistics.mean(v):.1f}" for k, v in d.items()),
+        ]
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -321,6 +356,9 @@ def main():
     if a.group == "e2v3":
         dup = a.dir / "e2v3_dup.json"
         text = e2v3(rows, json.loads(dup.read_text()) if dup.exists() else None)
+    elif a.group == "p1_ep":
+        dup = a.dir / "p1_ep_dup" / "p1_ep.json"
+        text = p1_ep(rows, json.loads(dup.read_text()) if dup.exists() else None)
     else:
         text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2, "gate2": gate2, "e1v3": e1v3}[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
