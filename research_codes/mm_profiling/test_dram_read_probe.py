@@ -75,6 +75,23 @@ def bank_args(nbanks, bank0, stride, offset, n_blocks, reqs, req_bytes):
     return dict(mode=1, n_blocks=n_blocks, reqs=reqs, req_bytes=req_bytes, p=(nbanks, bank0, stride, offset))
 
 
+def issued_requests(c):
+    """Requests the kernel issues for one core's args (mode 0 / 1), skipped bank excluded (plan v3 changelog 51:
+    counted on the host, not in the issue loop)."""
+    n = c["n_blocks"] * c["reqs"]
+    skip = c.get("skip", 0xFF)
+    if skip >= 8:
+        return n
+    Nt, c0, W, k0 = c["p"]
+    banks = []
+    for g in range(n):
+        if c["mode"] == 0:
+            banks.append(((k0 + g // W) * Nt + c0 + g % W) % 8)
+        else:
+            banks.append((c0 + g % Nt) % 8)
+    return sum(b != skip for b in banks)
+
+
 def matmul_strips(K, N, pc=None):
     """{logical core: strip args} for the tuner's 1D-multicast config of a K x N weight (row-major core order)."""
     pc = pc or derive_decode_1d_config(32, K, N)
@@ -156,6 +173,7 @@ class Probe:
         sync_addr = sync.buffer_address()
         sender = min(cfgs, key=lambda xy: (xy[1], xy[0])) if paced else None
         n_blocks = max(c["n_blocks"] for c in cfgs.values())
+        remap = any("skip" in c or "redirect" in c for c in cfgs.values())  # compile-time: off = no per-request work
         rt = ttnn.RuntimeArgs()
         for x, y in self.all:
             c = cfgs.get((x, y))
@@ -174,7 +192,7 @@ class Probe:
                 kernel_source=KERNEL,
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=crs(self.all),
-                compile_time_args=[],
+                compile_time_args=[int(remap)],
                 runtime_args=rt,
                 config=ttnn.DataMovementConfigDescriptor(
                     processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0 if noc == 0 else ttnn.NOC.NOC_1
@@ -237,7 +255,7 @@ class Probe:
                 t_start=int(w[1]),
                 t_end=int(w[2]),
                 t_first=int(w[4]),
-                issued=int(w[5]),
+                issued=issued_requests(c),
                 req_bytes=c["req_bytes"],
                 blocks=w[REC_HDR : REC_HDR + 4 * n].reshape(n, 4).tolist(),
                 virt=self.tr[xy],

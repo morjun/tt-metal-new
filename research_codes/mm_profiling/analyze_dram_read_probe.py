@@ -163,13 +163,166 @@ def e2(rows):
     return "\n".join(out)
 
 
+# ---- plan v3 (harness v2) groups -------------------------------------------------------------------------------------
+ENDPOINT_Y = {0: 11, 1: 2, 2: 9, 3: 5, 4: 11, 5: 3, 6: 8, 7: 6}  # bank -> NoC0 endpoint row, physical (plan v3 G1)
+
+
+def gate2(rows):
+    """Gate v2 criteria (plan v3): (a) median per-core 9.27-11.33; (b) bulk 324-430 and rho(phys y, end) <= -0.8;
+    (c) >= 45.6; every repeat. References: the generator-off runs."""
+    out = [
+        "| check | repeat | median per-core GB/s (min / max) | bulk GB/s | op µs | tail µs | ρ(phys y, end) | pass |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    verdict = defaultdict(list)
+    for r in sorted(rows, key=lambda r: (r["name"], r["rep"])):
+        rates = [c["rate"] for c in r["cores"].values()]
+        med = statistics.median(rates)
+        if r["name"] == "a_on":
+            ok = 9.27 <= med <= 11.33
+        elif r["name"] == "b_on":
+            ok = r["bulk"] is not None and 324 <= r["bulk"] <= 430 and r["rho_y_end"] <= -0.8  # no bulk window: fail
+        elif r["name"] == "c_burst":
+            ok = med >= 45.6
+        else:
+            ok = None
+        if ok is not None:
+            verdict[r["name"]].append(ok)
+        rho = "-" if r["rho_y_end"] is None else f"{r['rho_y_end']:+.2f}"
+        out.append(
+            f"| {r['name']} | {r['rep']} | {med:.2f} ({min(rates):.2f} / {max(rates):.2f}) |"
+            f" {'-' if r['bulk'] is None else format(r['bulk'], '.1f')} |"
+            f" {r['op_us']:.1f} | {r['tail_us']:.1f} | {rho} | {'' if ok is None else ok} |"
+        )
+    out += ["", "Verdict (every repeat): " + ", ".join(f"{k} {all(v)}" for k, v in sorted(verdict.items()))]
+    return "\n".join(out)
+
+
+def e1v3(rows):
+    """E1 v3 predictions (plan v3): B1 band, B2-B4 range, B5 endpoint-row classes, B6, R1-R4 thin-K threshold."""
+    per = defaultdict(list)
+    for r in rows:
+        (c,) = r["cores"].values()
+        per[r["name"]].append(c["rate"])
+    sd = pooled_sd(list(per.values()))
+    m = {k: statistics.mean(v) for k, v in per.items()}
+    fat = {k: v for k, v in m.items() if k.startswith("fat_")}
+    thin = {k: v for k, v in m.items() if k.startswith("thin_")}
+
+    def phys_of(name):
+        _, x, y, _ = name.split("_")
+        x, y = int(x), int(y)
+        return (x + 1 if x < 6 else x + 5, y + 2)
+
+    out = [
+        f"pooled SD {sd:.3f} GB/s ({len(per)} configs × {len(next(iter(per.values())))} repeats); 3 SD = {3 * sd:.3f}",
+        "",
+    ]
+    vals = list(fat.values())
+    out.append(
+        f"- fat-K (880 configs): min {min(vals):.2f}, median {statistics.median(vals):.2f}, max {max(vals):.2f} GB/s;"
+        f" range {(max(vals) - min(vals)) / sd:.1f} SD; within 9.27–11.33: {sum(9.27 <= v <= 11.33 for v in vals)} / {len(vals)};"
+        f" ≥ 10.3 + 3 SD: {sum(v >= 10.3 + 3 * sd for v in vals)} / {len(vals)}"
+    )
+    out += [
+        "",
+        "B5 classes per bank (endpoint row = cores in the bank's NoC0 endpoint row):",
+        "",
+        "| bank | endpoint row y | endpoint-row cores: n, mean (range) | others: n, mean (range) | Δ (SD) | within-class range (SD): row / others |",
+        "|---|---|---|---|---|---|",
+    ]
+    for b in range(8):
+        ks = [k for k in fat if k.endswith(f"_b{b}")]
+        row = [fat[k] for k in ks if phys_of(k)[1] == ENDPOINT_Y[b]]
+        oth = [fat[k] for k in ks if phys_of(k)[1] != ENDPOINT_Y[b]]
+        d = statistics.mean(row) - statistics.mean(oth)
+        out.append(
+            f"| {b} | {ENDPOINT_Y[b]} | {len(row)}, {statistics.mean(row):.2f} ({min(row):.2f}–{max(row):.2f}) |"
+            f" {len(oth)}, {statistics.mean(oth):.2f} ({min(oth):.2f}–{max(oth):.2f}) | {d:+.2f} ({d / sd:+.1f}) |"
+            f" {(max(row) - min(row)) / sd:.1f} / {(max(oth) - min(oth)) / sd:.1f} |"
+        )
+    tv = list(thin.values())
+    lo = [v for k, v in thin.items() if k.endswith("_lo")]
+    hi = [v for k, v in thin.items() if k.endswith("_hi")]
+    out += [
+        "",
+        f"- thin-K {{0–3}}: min {min(lo):.2f}, median {statistics.median(lo):.2f}, max {max(lo):.2f};"
+        f" {{4–7}}: min {min(hi):.2f}, median {statistics.median(hi):.2f}, max {max(hi):.2f} GB/s;"
+        f" ≥ 20.6 on both sets: {all(v >= 20.6 for v in tv)} ({sum(v >= 20.6 for v in tv)} / {len(tv)})",
+    ]
+    b0 = sorted((v, k) for k, v in fat.items() if k.endswith("_b0"))
+    med = b0[len(b0) // 2]
+    out.append(f"- E2 v3 position (median fat-K bank-0 rate): {med[1]} at {med[0]:.2f} GB/s (logical x, y in the name)")
+    return "\n".join(out)
+
+
+def e2v3(rows, dup_rows=None):
+    """E2 v3 predictions (plan v3): access x depth x N_b table with request sizes, B1-B4 contrasts in pooled SD,
+    between-process check on (strided, D 1, N_b 1)."""
+    per = defaultdict(list)
+    for r in rows:
+        (c,) = r["cores"].values()
+        per[r["name"]].append(c["rate"])
+    sd = pooled_sd(list(per.values()))
+    m = {k: statistics.mean(v) for k, v in per.items()}
+    size = lambda a, nb: 2048 if a != "burst" else 16384 // nb  # noqa: E731
+    out = [
+        f"pooled SD {sd:.3f} GB/s; 3 SD = {3 * sd:.3f}",
+        "",
+        "| access | D | N_b 1 | N_b 2 | N_b 4 | N_b 8 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for a in ("strided2k", "contig2k", "burst"):
+        for d in (1, 2, 4):
+            cells = [
+                f"{m[f'{a}_d{d}_b{nb}']:.2f} ({statistics.stdev(per[f'{a}_d{d}_b{nb}']):.2f}; {size(a, nb) // 1024} KB)"
+                for nb in (1, 2, 4, 8)
+            ]
+            out.append(f"| {a} | {d} | " + " | ".join(cells) + " |")
+
+    def z(k1, k2):
+        return (m[k2] - m[k1]) / sd
+
+    out += ["", "Contrasts (pooled SD):"]
+    nb1 = [m[f"{a}_d{d}_b1"] for a in ("strided2k", "contig2k", "burst") for d in (1, 2, 4)]
+    out.append(
+        f"- B1: at N_b 1 the 9 cells span {min(nb1):.2f}–{max(nb1):.2f} ({(max(nb1) - min(nb1)) / sd:.1f} SD);"
+        f" strided D1 by N_b: " + ", ".join(f"{m[f'strided2k_d1_b{nb}']:.2f}" for nb in (1, 2, 4, 8))
+    )
+    b2 = [(nb, d, z(f"strided2k_d{d}_b{nb}", f"contig2k_d{d}_b{nb}")) for nb in (1, 2, 4, 8) for d in (1, 2, 4)]
+    out.append("- B2 (contig − strided): " + ", ".join(f"N_b {nb} D {d}: {v:+.1f}" for nb, d, v in b2))
+    out.append(
+        f"- B3 (N_b 1, strided): D1→D2 {z('strided2k_d1_b1', 'strided2k_d2_b1'):+.1f}, D1→D4"
+        f" {z('strided2k_d1_b1', 'strided2k_d4_b1'):+.1f}, D2→D4 {z('strided2k_d2_b1', 'strided2k_d4_b1'):+.1f};"
+        f" contig: D1→D2 {z('contig2k_d1_b1', 'contig2k_d2_b1'):+.1f}, D2→D4 {z('contig2k_d2_b1', 'contig2k_d4_b1'):+.1f}"
+    )
+    b4 = [(nb, d, z(f"contig2k_d{d}_b{nb}", f"burst_d{d}_b{nb}")) for nb in (1, 2, 4) for d in (1, 2, 4)]
+    out.append(
+        "- B4 (burst − contig 2 KB, N_b ≤ 4; burst size 16 / 8 / 4 KB): "
+        + ", ".join(f"N_b {nb} D {d}: {v:+.1f}" for nb, d, v in b4)
+    )
+    if dup_rows:
+        dv = [list(r["cores"].values())[0]["rate"] for r in dup_rows]
+        mv = per["strided2k_d1_b1"]
+        out.append(
+            f"- between-process (strided, D 1, N_b 1): main {statistics.mean(mv):.3f} vs second process"
+            f" {statistics.mean(dv):.3f} GB/s; difference {statistics.mean(dv) - statistics.mean(mv):+.3f}"
+            f" = {(statistics.mean(dv) - statistics.mean(mv)) / sd:+.1f} pooled SD"
+        )
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
     p.add_argument("--group", default="gate")
     a = p.parse_args()
     rows = json.loads((a.dir / f"{a.group}.json").read_text())
-    text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2}[a.group](rows)
+    if a.group == "e2v3":
+        dup = a.dir / "e2v3_dup.json"
+        text = e2v3(rows, json.loads(dup.read_text()) if dup.exists() else None)
+    else:
+        text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2, "gate2": gate2, "e1v3": e1v3}[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)
 

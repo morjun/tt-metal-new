@@ -26,13 +26,16 @@
 //   15 sender translated x << 16 | y   16 sync_l1 (zeroed by the host before each run)
 //   17 skip bank (0..7: requests to this bank are skipped; >= 8: none)
 //   18 redirect: src bank << 8 | dst bank (requests to src go to dst at the same bank offset); 0xffff: none
+//      17 / 18 act only with compile-time arg 0 bit 0 set: any per-request work in the issue loop slows a 2 KB
+//      stream (17 ns per request measured, 20.2 -> 17.1 GB/s for one core; plan v3 changelog 51)
 //   19..23 reserved (0)
 // sync words (16 B apart: a NoC write keeps the source's offset within 16 B): [0] consumed counter (on the sender),
 //   [4] in0-valid (on each reader, set by the sender's multicast), [8] the sender's multicast source
 // Records (uint32): [0] n_blocks, [1] t_start (before the first issue), [2] t_end (final barrier returned = last word
-//   arrived), [3] a pacing wait timed out, [4] t_first_word (first sample with NIU_MST_RD_DATA_WORD_RECEIVED moved;
-//   exact to the polling interval at depth 1, an upper bound by <= depth blocks' issue time at depth > 1),
-//   [5] requests issued, [6..7] 0, then per block b at 8 + 4b: t_issue, t_done (its barrier returned),
+//   arrived), [3] a pacing wait timed out, [4] t_first_word (first sample with NIU_MST_RD_DATA_WORD_RECEIVED moved,
+//   polled only in barrier waits and between blocks: exact to the polling interval at depth 1, an upper bound by
+//   <= depth blocks' issue time at depth > 1), [5..7] 0 (requests issued are counted on the host), then per block b at
+//   8 + 4b: t_issue, t_done (its barrier returned),
 //   NIU_MST_RD_REQ_SENT, NIU_MST_RD_DATA_WORD_RECEIVED. Mode 4 writes dram_bank_to_noc_xy[noc][b] (x | y << 6) for
 //   noc 0 / 1 at 8 + 2b / 9 + 2b, b < 8.
 
@@ -120,10 +123,11 @@ void kernel_main() {
         return;
     }
     const uint32_t block_bytes = reqs * req_bytes;
+    constexpr bool kRemap = get_compile_time_arg_val(0) & 1;
     const uint32_t redirect_src = redirect >> 8, redirect_dst = redirect & 0xff;
     set_read_vc(vc);
     const uint32_t w0 = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_DATA_WORD_RECEIVED);
-    uint32_t t_first = 0, issued = 0;
+    uint32_t t_first = 0;
     auto poll_first = [&]() {
         if (!t_first && NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_DATA_WORD_RECEIVED) != w0) {
             t_first = get_timestamp_32b() | 1;  // never 0
@@ -143,19 +147,19 @@ void kernel_main() {
                 bank = (p1 + g % p0) % NUM_DRAM_BANKS_PROBE;
                 addr = base + p3 + (g / p0) * p2;
             }
-            if (bank == skip_bank) {
-                continue;
-            }
-            if (bank == redirect_src) {
-                bank = redirect_dst;
+            if constexpr (kRemap) {
+                if (bank == skip_bank) {
+                    continue;
+                }
+                if (bank == redirect_src) {
+                    bank = redirect_dst;
+                }
             }
             noc_async_read(
                 get_noc_addr_from_bank_id<true>(bank, addr, noc_index),
                 dst + (slot + i * req_bytes) % SCRATCH_BYTES,
                 req_bytes,
                 noc_index);
-            ++issued;
-            poll_first();
         }
     };
     auto log_done = [&](uint32_t b) {
@@ -207,6 +211,7 @@ void kernel_main() {
             wait_trid_slots(trid);
             rec[REC_BLOCKS + 4 * b] = get_timestamp_32b();
             issue_block(b);
+            poll_first();
         }
         const uint32_t first = n_blocks > depth ? n_blocks - depth : 0;
         for (uint32_t b = first; b < n_blocks; ++b) {
@@ -220,6 +225,5 @@ void kernel_main() {
         rec[2] = get_timestamp_32b();
     }
     rec[4] = t_first;
-    rec[5] = issued;
     set_read_vc(1);
 }
