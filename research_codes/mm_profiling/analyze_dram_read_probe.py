@@ -492,6 +492,35 @@ def e3_r10(rows, e1_rows):
     return "\n".join(out)
 
 
+def e7(rows):
+    """Plan v3 E7: V's (logical 0,0) rate per config, mean (SD), and its change from V alone in pooled SDs of V's rate;
+    the aggressors' summed rate and mean block latency (issue -> barrier return)."""
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r["cores"])
+    vr = {n: [c["0,0"]["rate"] for c in reps] for n, reps in by.items() if "0,0" in reps[0]}
+    sd = pooled_sd(list(vr.values()))
+    base = statistics.mean(vr["V_alone"])
+    out = [
+        f"Pooled SD of V's rate {sd:.3f} GB/s; V alone {base:.2f}.",
+        "",
+        "| config | V GB/s (SD) | Δ vs V alone, SD | aggressors' sum GB/s | aggressors' block latency µs |",
+        "|---|---|--:|--:|--:|",
+    ]
+    for name, reps in by.items():
+        agg = [{k: c for k, c in r.items() if k != "0,0"} for r in reps]
+        s = [sum(c["rate"] for c in a.values()) for a in agg] if agg[0] else None
+        lat = [statistics.mean(block_latency_us(c) for c in a.values()) for a in agg] if agg[0] else None
+        v = vr.get(name)
+        out.append(
+            f"| {name} | {f'{statistics.mean(v):.2f} ({statistics.stdev(v):.2f})' if v else '—'} |"
+            f" {f'{(statistics.mean(v) - base) / sd:+.1f}' if v and name != 'V_alone' else '—'} |"
+            f" {f'{statistics.mean(s):.1f}' if s else '—'} |"
+            f" {f'{statistics.mean(lat):.3f} ({statistics.stdev(lat):.3f})' if lat else '—'} |"
+        )
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -522,6 +551,7 @@ def main():
             "p1_ref": p1_ep,
             "p1_tab": p1_ep,
             "e4pc": e4pc,
+            "e7": e7,
         }[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)

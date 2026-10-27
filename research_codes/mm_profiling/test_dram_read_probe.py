@@ -474,6 +474,24 @@ def group_configs(p):
             ("AB_Ahigh", {A: burst(0, 15), B: burst(1 << 19, 0)}, 4, 1, 0, False),
             ("AB_Bhigh", {A: burst(0, 0), B: burst(1 << 19, 15)}, 4, 1, 0, False),
         ]
+    if GROUP in ("e7", "e7_dup"):
+        # plan v3 E7 (record §9.2e; changelog 54: harness, generator off): V = physical (1, 2) reads idle bank 2 on
+        # VC 1; 4 aggressors saturate bank 6. Placements from H4: "req" = (11..14, 2), sharing request links with V
+        # (row 2, upstream of the divergence at (0, 2)) and no response link; "resp" = (1, 3..6), sharing response
+        # links (column 1) and no request link. Strided 2 KB, D 1, disjoint regions.
+        lg = lambda px, py: (px - 1 if px <= 6 else px - 5, py - 2)  # noqa: E731
+        strided = lambda b, i, vc: dict(  # noqa: E731
+            bank_args(1, b, 8192, (i % 4) * 2048 + (i // 4) * (2 << 20), 32, 8, 2048), vc=vc
+        )
+        V = {lg(1, 2): strided(2, 0, 1)}
+        aggs = {"req": [lg(x, 2) for x in (11, 12, 13, 14)], "resp": [lg(1, y) for y in (3, 4, 5, 6)]}
+        agg = lambda pl, vc: {xy: strided(6, i, vc) for i, xy in enumerate(aggs[pl])}  # noqa: E731
+        out = [("V_alone", V, 1, 1, 0, False), ("agg1_alone", {aggs["req"][0]: strided(6, 0, 1)}, 1, 1, 0, False)]
+        for pl in ("req", "resp"):
+            for vc in (1, 2):
+                out.append((f"{pl}_agg_vc{vc}_alone", agg(pl, vc), 1, 1, 0, False))
+                out.append((f"{pl}_V_agg_vc{vc}", {**V, **agg(pl, vc)}, 1, 1, 0, False))
+        return out
     if GROUP == "e3_r10":
         # E3's inconclusive CV contrast (record §9.2e): row near / far, strided, k = 4 / 8, banks 2 / 0, plus every
         # endpoint-row core alone on its bank in the same process (second control)
