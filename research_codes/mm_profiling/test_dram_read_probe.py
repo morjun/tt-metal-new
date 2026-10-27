@@ -173,7 +173,9 @@ class Probe:
         sync_addr = sync.buffer_address()
         sender = min(cfgs, key=lambda xy: (xy[1], xy[0])) if paced else None
         n_blocks = max(c["n_blocks"] for c in cfgs.values())
-        remap = any("skip" in c or "redirect" in c or "bank0_xy" in c for c in cfgs.values())  # compile-time
+        # compile-time: remap (bit 0) for skip, and for redirect / bank0_xy outside the table path (bit 1)
+        table = any(c.get("table") for c in cfgs.values())
+        remap = any("skip" in c or (not table and ("redirect" in c or "bank0_xy" in c)) for c in cfgs.values())
         rt = ttnn.RuntimeArgs()
         for x, y in self.all:
             c = cfgs.get((x, y))
@@ -193,7 +195,7 @@ class Probe:
                 kernel_source=KERNEL,
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=crs(self.all),
-                compile_time_args=[int(remap)],
+                compile_time_args=[int(remap) | int(table) << 1],
                 runtime_args=rt,
                 config=ttnn.DataMovementConfigDescriptor(
                     processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0 if noc == 0 else ttnn.NOC.NOC_1
@@ -387,6 +389,23 @@ def group_configs(p):
             out += [(f"b{b}only", only(b), 1, 1, 0, False)]
             out += [(f"b{b}only_remap", {k: dict(v, bank0_xy=0) for k, v in only(b).items()}, 1, 1, 0, False)]
         return out
+    if GROUP == "p1_tab":
+        # P1 next limit on the table path (record §9.2e): the old path (no remap) as reference, then the table path
+        # through (0, 11) and (0, 0), bank 0's / bank 1's readers alone and the full fat-K load. Generator off.
+        fat, _ = matmul_strips(8192, 1024)
+        only = lambda b: {k: v for k, v in fat.items() if k[0] == b}  # noqa: E731
+        tab = lambda cf, xy: {k: dict(v, table=True, bank0_xy=xy) for k, v in cf.items()}  # noqa: E731
+        E0 = 17 | 12 << 6
+        return [
+            ("full_old", fat, 1, 1, 0, False),
+            ("b0only_old", only(0), 1, 1, 0, False),
+            ("b1only_old", only(1), 1, 1, 0, False),
+            ("full_tab_e11", tab(fat, 0), 1, 1, 0, False),
+            ("b0only_tab_e11", tab(only(0), 0), 1, 1, 0, False),
+            ("b1only_tab", tab(only(1), 0), 1, 1, 0, False),
+            ("full_tab_e00", tab(fat, E0), 1, 1, 0, False),
+            ("b0only_tab_e00", tab(only(0), E0), 1, 1, 0, False),
+        ]
     if GROUP == "e1v3":
         out = []
         for xy in p.all:

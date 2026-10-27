@@ -29,7 +29,11 @@
 //      17 / 18 act only with compile-time arg 0 bit 0 set: any per-request work in the issue loop slows a 2 KB
 //      stream (17 ns per request measured, 20.2 -> 17.1 GB/s for one core; plan v3 changelog 51)
 //   19 bank-0 endpoint override: translated x | y << 6 (0: the default endpoint); like the production knob
-//      TT_MM1D_IN1_BANK0_XY (record §9.2e E6b arm iv). Acts only with compile-time arg 0 bit 0 (remap)
+//      TT_MM1D_IN1_BANK0_XY (record §9.2e E6b arm iv). Acts only with compile-time arg 0 bit 0 (remap) or bit 1
+//      (table)
+//   Compile-time arg 0 bit 1 (table): every request's NoC address is a per-bank base from an 8-entry table built
+//      once before the stream, with 18 / 19 applied in the table, so every request costs the same whatever the
+//      endpoint. The remap path (bit 0) slows bank-0 requests by 10% even with no override (record §9.2e p1_ref)
 //   20..23 reserved (0)
 // sync words (16 B apart: a NoC write keeps the source's offset within 16 B): [0] consumed counter (on the sender),
 //   [4] in0-valid (on each reader, set by the sender's multicast), [8] the sender's multicast source
@@ -127,7 +131,16 @@ void kernel_main() {
     }
     const uint32_t block_bytes = reqs * req_bytes;
     constexpr bool kRemap = get_compile_time_arg_val(0) & 1;
+    constexpr bool kTable = get_compile_time_arg_val(0) & 2;
     const uint32_t redirect_src = redirect >> 8, redirect_dst = redirect & 0xff;
+    uint64_t bank_base[NUM_DRAM_BANKS_PROBE];
+    if constexpr (kTable) {
+        for (uint32_t b = 0; b < NUM_DRAM_BANKS_PROBE; ++b) {
+            const uint32_t s = b == redirect_src ? redirect_dst : b;
+            const uint64_t xy = (s == 0 && bank0_xy) ? bank0_xy : dram_bank_to_noc_xy[noc_index][s];
+            bank_base[b] = (xy << NOC_ADDR_COORD_SHIFT) | bank_to_dram_offset[s];
+        }
+    }
     set_read_vc(vc);
     const uint32_t w0 = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_DATA_WORD_RECEIVED);
     uint32_t t_first = 0;
@@ -150,11 +163,18 @@ void kernel_main() {
                 bank = (p1 + g % p0) % NUM_DRAM_BANKS_PROBE;
                 addr = base + p3 + (g / p0) * p2;
             }
-            uint64_t src = get_noc_addr_from_bank_id<true>(bank, addr, noc_index);
+            uint64_t src;
+            if constexpr (kTable) {
+                src = bank_base[bank] + addr;
+            } else {
+                src = get_noc_addr_from_bank_id<true>(bank, addr, noc_index);
+            }
             if constexpr (kRemap) {
                 if (bank == skip_bank) {
                     continue;
                 }
+            }
+            if constexpr (kRemap && !kTable) {
                 if (bank == redirect_src) {
                     bank = redirect_dst;
                     src = get_noc_addr_from_bank_id<true>(bank, addr, noc_index);
