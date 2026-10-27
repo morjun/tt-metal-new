@@ -186,7 +186,12 @@ class Probe:
             assert not paced or c.get("depth", depth) == 1
             sx, sy = self.tr[sender] if paced else (0, 0)
             a = [1, c["mode"], self.base, c["n_blocks"], c["reqs"], c["req_bytes"], c.get("depth", depth)]
-            a += [c.get("vc", vc), *c["p"], self.scratch.buffer_address(), self.rec.buffer_address()]
+            a += [
+                c.get("vc", vc) | c.get("prio", 0) << 4,
+                *c["p"],
+                self.scratch.buffer_address(),
+                self.rec.buffer_address(),
+            ]
             a += [int(paced), sx << 16 | sy, sync_addr, c.get("skip", 0xFF), c.get("redirect", 0xFFFF)]
             a += [c.get("bank0_xy", 0)]
             rt[x][y] = a + [0] * (NARGS - len(a))
@@ -258,6 +263,7 @@ class Probe:
                 t_start=int(w[1]),
                 t_end=int(w[2]),
                 t_first=int(w[4]),
+                noc_ctrl=int(w[5]),
                 issued=issued_requests(c),
                 req_bytes=c["req_bytes"],
                 blocks=w[REC_HDR : REC_HDR + 4 * n].reshape(n, 4).tolist(),
@@ -405,6 +411,20 @@ def group_configs(p):
             ("b1only_tab", tab(only(1), 0), 1, 1, 0, False),
             ("full_tab_e00", tab(fat, E0), 1, 1, 0, False),
             ("b0only_tab_e00", tab(only(0), E0), 1, 1, 0, False),
+        ]
+    if GROUP == "e4pc":
+        # E4 positive control (plan v3): physical (15, 9) = logical (10, 7) "A" and (14, 9) = (9, 7) "B", in bank 2's
+        # endpoint row, 16 KB bursts from bank 2 at depth 4 (disjoint 512 KB regions); alone, together at equal
+        # priority, and with one of them at ARB_PRIORITY 15. Generator off.
+        A, B = (10, 7), (9, 7)
+        burst = lambda off, p: dict(bank_args(1, 2, 16384, off, 32, 1, 16384), prio=p)  # noqa: E731
+        return [
+            ("A_alone", {A: burst(0, 0)}, 4, 1, 0, False),
+            ("B_alone", {B: burst(1 << 19, 0)}, 4, 1, 0, False),
+            ("A_alone_p15", {A: burst(0, 15)}, 4, 1, 0, False),
+            ("AB_equal", {A: burst(0, 0), B: burst(1 << 19, 0)}, 4, 1, 0, False),
+            ("AB_Ahigh", {A: burst(0, 15), B: burst(1 << 19, 0)}, 4, 1, 0, False),
+            ("AB_Bhigh", {A: burst(0, 0), B: burst(1 << 19, 15)}, 4, 1, 0, False),
         ]
     if GROUP == "e1v3":
         out = []

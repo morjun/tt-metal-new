@@ -347,6 +347,25 @@ def p1_ep(rows, dup_rows=None):
     return "\n".join(out)
 
 
+def e4pc(rows):
+    """E4 positive control: per config, per-core rate of A (logical 10,7) and B (9,7), their sum and A - B, mean (SD)
+    over repeats; NOC_CTRL's priority field (bits 27-30) as read back after the stream."""
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r["cores"])
+    out = ["| config | A GB/s | B GB/s | sum | A − B | priority field A / B |", "|---|---|---|---|---|---|"]
+    ms = lambda v: f"{statistics.mean(v):.2f} ({statistics.stdev(v):.2f})"  # noqa: E731
+    for name, reps in by.items():
+        a = [c["10,7"]["rate"] for c in reps if "10,7" in c]
+        b = [c["9,7"]["rate"] for c in reps if "9,7" in c]
+        pr = lambda k: sorted({(c[k]["noc_ctrl"] >> 27) & 0xF for c in reps if k in c})  # noqa: E731
+        row = [name, ms(a) if a else "—", ms(b) if b else "—"]
+        row += [ms([x + y for x, y in zip(a, b)]), ms([x - y for x, y in zip(a, b)])] if a and b else ["—", "—"]
+        row += [f"{pr('10,7')} / {pr('9,7')}"]
+        out.append("| " + " | ".join(row) + " |")
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -369,6 +388,7 @@ def main():
             "e1v3": e1v3,
             "p1_ref": p1_ep,
             "p1_tab": p1_ep,
+            "e4pc": e4pc,
         }[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)

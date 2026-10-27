@@ -11,7 +11,8 @@
 //   2 base_addr (DRAM buffer)   3 n_blocks   4 reqs_per_block   5 req_bytes
 //   6 depth: 1 = full read barrier per block (production); 2..4 = transaction IDs, `depth` blocks outstanding
 //   7 request VC (0..3): written into the read command buffer's NOC_CTRL, as MM_IN1_VC_MODE does, because in
-//     DM_DEDICATED_NOC mode a read's VC is the sticky NOC_CTRL value, not noc_async_read's argument; restored to 1
+//     DM_DEDICATED_NOC mode a read's VC is the sticky NOC_CTRL value, not noc_async_read's argument; restored to 1.
+//     Bits 4..7: request arbitration priority NOC_CMD_ARB_PRIORITY(p) in the same register (0 = default)
 //   mode 0 (production in1 reader order, reader_bmm_tile_layout_in1_sender_writer_padding.cpp:459-476: K rows
 //          outer, N columns inner): 8 Nt, 9 c0, 10 W (per_core_N), 11 k0 -> request g: page (k0 + g / W) * Nt +
 //          c0 + g % W, bank page % 8, bank address base + (page / 8) * req_bytes
@@ -40,7 +41,8 @@
 // Records (uint32): [0] n_blocks, [1] t_start (before the first issue), [2] t_end (final barrier returned = last word
 //   arrived), [3] a pacing wait timed out, [4] t_first_word (first sample with NIU_MST_RD_DATA_WORD_RECEIVED moved,
 //   polled only in barrier waits and between blocks: exact to the polling interval at depth 1, an upper bound by
-//   <= depth blocks' issue time at depth > 1), [5..7] 0 (requests issued are counted on the host), then per block b at
+//   <= depth blocks' issue time at depth > 1), [5] NOC_CTRL of the read command buffer after the stream, [6..7] 0
+//   (requests issued are counted on the host), then per block b at
 //   8 + 4b: t_issue, t_done (its barrier returned),
 //   NIU_MST_RD_REQ_SENT, NIU_MST_RD_DATA_WORD_RECEIVED. Mode 4 writes dram_bank_to_noc_xy[noc][b] (x | y << 6) for
 //   noc 0 / 1 at 8 + 2b / 9 + 2b, b < 8.
@@ -76,7 +78,8 @@ inline void set_read_vc(uint32_t vc) {
         noc_index,
         read_cmd_buf,
         NOC_CTRL,
-        NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(vc));
+        NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(vc & 0x3) |
+            NOC_CMD_ARB_PRIORITY((vc >> 4) & 0xf));
 }
 
 inline void wait_trid_slots(uint32_t trid) {
@@ -249,5 +252,6 @@ void kernel_main() {
         rec[2] = get_timestamp_32b();
     }
     rec[4] = t_first;
+    rec[5] = NOC_CMD_BUF_READ_REG(noc_index, read_cmd_buf, NOC_CTRL);  // the request VC / priority in force at the end
     set_read_vc(1);
 }
