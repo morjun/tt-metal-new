@@ -117,19 +117,24 @@ def test_endpoint_swap(mesh_device):
 
 
 def compare(out):
+    """Bit-identity of every output against the first base process; op time per arm pooled over its processes
+    (5 rounds each), with the pooled SD of a round and the between-process difference within each arm."""
     import statistics
 
-    a, b = torch.load(out / "base.pt"), torch.load(out / "ep0.pt")
-    ta, tb = json.loads((out / "base.json").read_text()), json.loads((out / "ep0.json").read_text())
-    for name in a:
-        same = torch.equal(a[name], b[name])
-        diff = int((a[name] != b[name]).sum())
-        xa, xb = ta["times"][name], tb["times"][name]
-        sd = (0.5 * (statistics.variance(xa) + statistics.variance(xb))) ** 0.5
-        d = statistics.mean(xb) - statistics.mean(xa)
+    arms = {"base": ["base", "base_b"], "ep0": ["ep0", "ep0_b"]}
+    outs = {a: torch.load(out / f"{a}.pt") for v in arms.values() for a in v if (out / f"{a}.pt").exists()}
+    tim = {a: json.loads((out / f"{a}.json").read_text())["times"] for a in outs}
+    ref = outs["base"]
+    for name in ref:
+        same = {a: torch.equal(ref[name], o[name]) for a, o in outs.items()}
+        x = {k: [t for a in v if a in tim for t in tim[a][name]] for k, v in arms.items()}
+        groups = [tim[a][name] for a in tim]
+        sd = (sum((len(g) - 1) * statistics.variance(g) for g in groups) / sum(len(g) - 1 for g in groups)) ** 0.5
+        mb, me = statistics.mean(x["base"]), statistics.mean(x["ep0"])
+        within = {k: [round(statistics.mean(tim[a][name]), 2) for a in v if a in tim] for k, v in arms.items()}
         print(
-            f"{name}: bit-identical {same} ({diff} differ); base {statistics.mean(xa):.2f} us, ep0 {statistics.mean(xb):.2f} us,"
-            f" delta {d:+.2f} us ({d / statistics.mean(xa) * 100:+.1f}%, {d / sd:+.1f} pooled SD of a 5-round mean)"
+            f"{name}: bit-identical to base {same}; base {mb:.2f} us {within['base']}, ep0 {me:.2f} us {within['ep0']};"
+            f" delta {me - mb:+.2f} us ({(me - mb) / mb * 100:+.1f}%, {(me - mb) / sd:+.1f} pooled SD of a round, SD {sd:.3f})"
         )
 
 

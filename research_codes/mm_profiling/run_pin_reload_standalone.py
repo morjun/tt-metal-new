@@ -150,6 +150,11 @@ def arm_spec(arm):
         # §9.2): 1 = logical y & 3, 2 = logical x & 3, 3 = (x + y) & 3
         base, extra, width = arm_spec(arm[: m.start()])
         return base, {**extra, "TT_MM1D_IN1_VC_MODE": m.group(1)}, width
+    if arm.endswith("+ep0"):
+        # DRAM bank 0's in1 tiles read through endpoint (0, 0) instead of (0, 11) in every 1D-mcast matmul
+        # (TT_MM1D_IN1_BANK0_XY = translated (17, 12) = 17 | 12 << 6; record §9.2e E6b arm iv). Routing only: class C
+        base, extra, width = arm_spec(arm[: -len("+ep0")])
+        return base, {**extra, "TT_MM1D_IN1_BANK0_XY": "785"}, width
     if arm.endswith("+gridfatk"):
         # fat-K pre_projection / o_proj / down_proj on the 11-wide row-major prefix (32 cores, 11 + 11 + 10) instead
         # of the tuner's 8 x 4 (GEMMA4_MM_GRID_SHAPES, pcN 1; record §9.2e E2c), appended to any existing override

@@ -178,6 +178,7 @@ def knobs(arm):
         "lm_head": head,
         "head reload": reload,
         "request VC": vc_mode_name(env.get("TT_MM1D_IN1_VC_MODE", "0")),
+        "bank-0 endpoint": "(0, 0) (+ep0)" if env.get("TT_MM1D_IN1_BANK0_XY") == "785" else "default (0, 11)",
         "in1 NoC": "NoC1 (swapped)" if env.get("TT_MM1D_MCAST_IN0_SWAP_NOCS") else "NoC0",
         "logits": "L1" if env.get("GEMMA4_LMHEAD_LOGITS_L1") == "1" else "DRAM",
         "NIU sampler": env.get("TT_MM1D_IN1_NIU_SAMPLE", "off"),
