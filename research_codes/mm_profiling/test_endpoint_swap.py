@@ -37,12 +37,12 @@ OUT = Path(os.getenv("EP_OUT", "generated/dram_read_probe/ep0"))
 def _configs():
     from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
-    def wide(K, N, pcn):
+    def wide(K, N, pcn, grid=None):
         Nt = N // 32
         cores = -(-Nt // pcn)
         base = derive_decode_1d_config(32, K, N)
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
-            compute_with_storage_grid_size=ttnn.CoreCoord(min(cores, 11), -(-cores // 11)),
+            compute_with_storage_grid_size=ttnn.CoreCoord(*(grid or (min(cores, 11), -(-cores // 11)))),
             in0_block_w=base.in0_block_w,
             out_subblock_h=1,
             out_subblock_w=1,
@@ -58,6 +58,10 @@ def _configs():
         ("gate_proj_8x8", 1024, 8192, derive_decode_1d_config(32, 1024, 8192)),
         ("gate_proj_86", 1024, 8192, wide(1024, 8192, 3)),
     ]
+    if os.getenv("EP_E6"):
+        # plan v3 E6 on the production kernel (record §9.2e): A64 (tuner 8 x 8, pcN 4), A86 (11-wide prefix, pcN 3),
+        # W2 (A64's 64 cores at pcN 3: 192 of 256 columns, A86's per-core bytes)
+        out = out[1:] + [("gate_w2_8x8_pcn3", 1024, 6144, wide(1024, 6144, 3, (8, 8)))]
     if os.getenv("EP_TAIL"):
         # the 59,840-column pin's DRAM tail (1024 x 202,304) on its best config, 66 / ow6 (lm_head_out_block_w_config):
         # 96 cores, the last with 52 valid columns of 66 (it also reads tiles past N)
