@@ -183,6 +183,16 @@ def _drisc_start(st, head):
     ex = ttnn._ttnn.operations.experimental
     dev = st.device
     senders = ex.drisc_senders(dev)
+    # Stream mode (drisc_reload_resident.cpp) makes a DRISC's NIU0 serve DRISC L1 instead of GDDR, so a matmul
+    # reading bank 0 through that endpoint (TT_MM1D_IN1_BANK0_XY, packed x | y << 6) would get the wrong bytes:
+    # leave that DRISC out; the bank's other sender pushes all of its pages.
+    ep = int(os.getenv("TT_MM1D_IN1_BANK0_XY", "0"))
+    if ep:
+        kept = [s for s in senders if (s[2].x, s[2].y) != (ep & 0x3F, ep >> 6)]
+        logger.info(
+            f"[lm-head-reload] TT_MM1D_IN1_BANK0_XY=({ep & 0x3F}, {ep >> 6}): {len(senders) - len(kept)} DRISC left out"
+        )
+        senders = kept
     base, size = ex.drisc_l1_unreserved(dev)
     chunk = min(DRISC_CHUNK, size // (2 * PAGE))
     banks = sorted({b for b, _, _ in senders})
