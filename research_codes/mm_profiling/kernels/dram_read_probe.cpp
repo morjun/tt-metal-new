@@ -211,17 +211,18 @@ void kernel_main() {
     };
 
     // E8 bank modes: this core's tiles of block b in bank k, under transaction ID k + 1
+    // With Nt % 8 == 0 bank k holds exactly one column w of the strip (w = k - c0 mod 8 < W): its tiles in block b are
+    // K rows h of that column, request slot i = h * W + w, page (k0 + b * iw + h) * Nt + c0 + w, computed directly
+    // (looping over all of the block's requests per bank cost 4x the issue work: 10.9 vs 26.1 GB/s, e8_dbg)
+    const uint32_t iw = p2 ? reqs / p2 : 0;
     auto issue_bank = [&](uint32_t b, uint32_t k) {
         noc_async_read_set_trid(k + 1, noc_index);
-        for (uint32_t i = 0; i < reqs; ++i) {
-            const uint32_t g = b * reqs + i;
-            const uint32_t page = (p3 + g / p2) * p0 + p1 + g % p2;
-            if (page % NUM_DRAM_BANKS_PROBE != k) {
-                continue;
-            }
+        const uint32_t w = (k + NUM_DRAM_BANKS_PROBE - p1 % NUM_DRAM_BANKS_PROBE) % NUM_DRAM_BANKS_PROBE;
+        uint32_t page = (p3 + b * iw) * p0 + p1 + w;
+        for (uint32_t h = 0; h < iw; ++h, page += p0) {
             const uint64_t src =
                 get_noc_addr_from_bank_id<true>(k, base + (page / NUM_DRAM_BANKS_PROBE) * req_bytes, noc_index);
-            noc_async_read(src, dst + (i * req_bytes) % SCRATCH_BYTES, req_bytes, noc_index);
+            noc_async_read(src, dst + ((h * p2 + w) * req_bytes) % SCRATCH_BYTES, req_bytes, noc_index);
         }
     };
     bool has_bank[NUM_DRAM_BANKS_PROBE] = {};
