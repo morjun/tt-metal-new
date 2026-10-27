@@ -128,12 +128,12 @@ def test_endpoint_swap(mesh_device):
         (OUT / f"{ARM}.json").write_text(json.dumps(dict(arm=ARM, env=os.getenv("TT_MM1D_IN1_BANK0_XY"), times=times)))
 
 
-def compare(out):
+def compare(out, arm="ep0"):
     """Bit-identity of every output against the first base process; op time per arm pooled over its processes
     (5 rounds each), with the pooled SD of a round and the between-process difference within each arm."""
     import statistics
 
-    arms = {"base": ["base", "base_b"], "ep0": ["ep0", "ep0_b"]}
+    arms = {"base": ["base", "base_b"], arm: [arm, f"{arm}_b"]}
     outs = {a: torch.load(out / f"{a}.pt") for v in arms.values() for a in v if (out / f"{a}.pt").exists()}
     tim = {a: json.loads((out / f"{a}.json").read_text())["times"] for a in outs}
     ref = outs["base"]
@@ -142,13 +142,13 @@ def compare(out):
         x = {k: [t for a in v if a in tim for t in tim[a][name]] for k, v in arms.items()}
         groups = [tim[a][name] for a in tim]
         sd = (sum((len(g) - 1) * statistics.variance(g) for g in groups) / sum(len(g) - 1 for g in groups)) ** 0.5
-        mb, me = statistics.mean(x["base"]), statistics.mean(x["ep0"])
+        mb, me = statistics.mean(x["base"]), statistics.mean(x[arm])
         within = {k: [round(statistics.mean(tim[a][name]), 2) for a in v if a in tim] for k, v in arms.items()}
         print(
-            f"{name}: bit-identical to base {same}; base {mb:.2f} us {within['base']}, ep0 {me:.2f} us {within['ep0']};"
+            f"{name}: bit-identical to base {same}; base {mb:.2f} us {within['base']}, {arm} {me:.2f} us {within[arm]};"
             f" delta {me - mb:+.2f} us ({(me - mb) / mb * 100:+.1f}%, {(me - mb) / sd:+.1f} pooled SD of a round, SD {sd:.3f})"
         )
 
 
 if __name__ == "__main__":
-    compare(Path(sys.argv[1]))
+    compare(Path(sys.argv[1]), *sys.argv[2:3])
