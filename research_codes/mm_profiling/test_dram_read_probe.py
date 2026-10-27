@@ -126,9 +126,10 @@ class Probe:
         self.rec = l1(REC_BYTES)
         self.scratch = l1(SCRATCH_BYTES)
         self.in0buf = l1(3 * IN0_BLOCK)  # [0, 16 KB) sender source, then the readers' 2 slots
-        # 64 MB bf16 tile tensor, DRAM interleaved: 32,768 pages of 2 KB, 4,096 per bank (8 MB per bank)
+        # 128 MB bf16 tile tensor, DRAM interleaved: 65,536 pages of 2 KB, 8,192 per bank (16 MB per bank; E3 gives
+        # up to 32 cores disjoint regions of one bank)
         self.dram = ttnn.allocate_tensor_on_device(
-            ttnn.Shape([1, 1, 8192, 4096]), ttnn.bfloat16, ttnn.TILE_LAYOUT, dev, ttnn.DRAM_MEMORY_CONFIG
+            ttnn.Shape([1, 1, 16384, 4096]), ttnn.bfloat16, ttnn.TILE_LAYOUT, dev, ttnn.DRAM_MEMORY_CONFIG
         )
         self.base = self.dram.buffer_address()
         logger.info(f"[probe] grid {g.x}x{g.y}; DRAM base {self.base:#x}; rec {self.rec.buffer_address():#x}")
@@ -339,6 +340,53 @@ def _median(v):
     return v[len(v) // 2] if len(v) % 2 else 0.5 * (v[len(v) // 2 - 1] + v[len(v) // 2])
 
 
+def e3_configs(p):
+    """Plan v3 E3 (record §9.2e; changelog 54: harness, generator off): k cores share one bank, D 1, VC 1, NoC0.
+
+    Banks 2 then 0. Patterns: strided 2 KB (same-bank tiles 8 KB apart, the production layout) and contiguous 2 KB;
+    512 KB per core from disjoint regions of the bank. Placements (physical): row = the bank's endpoint row, then the
+    next rows south, x nearest-first (15, 14, ..., 1; request hops 17 - x) or farthest-first (1, ..., 15) within each
+    row; column = x 15 ordered by request hops; spread = evenly over the grid (row-major). Secondary no-sharing
+    control: the row placement's first k <= 8 cores, core i reading bank (b + i) % 8 alone."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from noc_routes import ENDPOINTS_NOC0, hops
+
+    logical = lambda px, py: (px - 1 if px <= 6 else px - 5, py - 2)  # noqa: E731
+    XS = (15, 14, 13, 12, 11, 6, 5, 4, 3, 2, 1)
+
+    def cfg(banks, cores, stride):
+        out = {}
+        for i, xy in enumerate(cores):
+            off = (i % 4) * 2048 + (i // 4) * (2 << 20) if stride == 8192 else i * (512 << 10)
+            out[xy] = bank_args(1, banks[i], stride, off, 32, 8, 2048)
+        return out
+
+    out = []
+    for b in (2, 0):
+        ep = ENDPOINTS_NOC0[b]
+        rows = [ep[1]] + [(ep[1] - 2 + d) % 10 + 2 for d in (1, 2)]  # next rows south within the grid's y 2-11
+        place = {
+            ("row", "near"): [logical(x, y) for y in rows for x in XS],
+            ("row", "far"): [logical(x, y) for y in rows for x in reversed(XS)],
+            ("col", "near"): [logical(15, y) for y in sorted(range(2, 12), key=lambda y: hops((15, y), ep)[0])],
+        }
+        place[("col", "far")] = list(reversed(place[("col", "near")]))
+        ks = {"row": (1, 2, 4, 8, 11, 16, 32), "col": (1, 2, 4, 8)}
+        for pat, stride in (("str", 8192), ("con", 2048)):
+            for (pl, order), cores in place.items():
+                for k in ks[pl]:
+                    out.append((f"b{b}_{pl}_{order}_{pat}_k{k}", cfg([b] * k, cores[:k], stride), 1, 1, 0, False))
+            for k in (4, 8, 16, 32):
+                cores = [p.all[int((j + 0.5) * len(p.all) / k)] for j in range(k)]
+                out.append((f"b{b}_spread_{pat}_k{k}", cfg([b] * k, cores, stride), 1, 1, 0, False))
+        for k in (2, 4, 8):
+            cores = place[("row", "near")][:k]
+            out.append((f"b{b}_own_str_k{k}", cfg([(b + i) % 8 for i in range(k)], cores, 8192), 1, 1, 0, False))
+    return out
+
+
 def group_configs(p):
     """[(name, cfgs, depth, vc, noc, paced)] for GROUP."""
     if GROUP == "debug_rect":
@@ -426,6 +474,9 @@ def group_configs(p):
             ("AB_Ahigh", {A: burst(0, 15), B: burst(1 << 19, 0)}, 4, 1, 0, False),
             ("AB_Bhigh", {A: burst(0, 0), B: burst(1 << 19, 15)}, 4, 1, 0, False),
         ]
+    if GROUP in ("e3", "e3_dup"):
+        out = e3_configs(p)
+        return out if GROUP == "e3" else [c for c in out if c[0] == "b2_row_near_str_k8"]
     if GROUP == "e1v3":
         out = []
         for xy in p.all:

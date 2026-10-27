@@ -366,6 +366,103 @@ def e4pc(rows):
     return "\n".join(out)
 
 
+def e3(rows, e1_rows, dup_rows=None):
+    """Plan v3 E3: per config, mean per-core rate, bank aggregate (bytes / op-time proxy), max / min, CV and
+    rho(request hops, rate) per repeat (rho at k >= 8), the no-sharing control's CV (E1 v3 alone rates of the same
+    cores and bank, strided only; another process), the fastest core's physical x, per-class means (endpoint row vs
+    other rows) and the largest H4 response-link load from the mean rates. Pooled SDs of CV and rho over configs."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from noc_routes import ENDPOINTS_NOC0, hops, response_route
+
+    phys = lambda x, y: (x + 1 if x < 6 else x + 5, y + 2)  # noqa: E731
+    alone = defaultdict(list)
+    for r in e1_rows:
+        if r["name"].startswith("fat_"):
+            _, x, y, b = r["name"].split("_")
+            alone[(int(x), int(y), int(b[1:]))].append(next(iter(r["cores"].values()))["rate"])
+    cv = lambda v: statistics.stdev(v) / statistics.mean(v)  # noqa: E731
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r)
+    res = {}
+    for name, reps in by.items():
+        b = int(name.split("_")[0][1:])
+        keys = list(reps[0]["cores"])
+        xy = {k: phys(*map(int, k.split(","))) for k in keys}
+        rates = {k: [r["cores"][k]["rate"] for r in reps] for k in keys}
+        mean = {k: statistics.mean(v) for k, v in rates.items()}
+        hop = {k: hops(xy[k], ENDPOINTS_NOC0[b])[0] for k in keys}
+        per_cv = [cv([r["cores"][k]["rate"] for k in keys]) for r in reps] if len(keys) > 1 else []
+        per_rho = (
+            [spearman([hop[k] for k in keys], [r["cores"][k]["rate"] for k in keys]) for r in reps]
+            if len(keys) >= 8 and "_own_" not in name
+            else []
+        )
+        agg = [sum(c["issued"] * c["req_bytes"] for c in r["cores"].values()) / (r["op_us"] * 1e3) for r in reps]
+        ctrl, ctrl_mean = None, None
+        if "_str_" in name and "_own_" not in name:
+            al = [alone.get((*map(int, k.split(",")), b)) for k in keys]
+            if all(al):
+                ctrl_mean = statistics.mean(statistics.mean(a) for a in al)
+                if len(keys) > 1:
+                    ctrl = [cv([a[j] for a in al]) for j in range(min(len(a) for a in al))]
+        load = defaultdict(float)
+        for k in keys if "_own_" not in name else []:
+            for link in response_route(xy[k], ENDPOINTS_NOC0[b]):
+                load[link] += mean[k]
+        ey = ENDPOINTS_NOC0[b][1]
+        cls = {c: [mean[k] for k in keys if (xy[k][1] == ey) == (c == "row")] for c in ("row", "other")}
+        res[name] = dict(
+            k=len(keys),
+            mean=statistics.mean(mean.values()),
+            agg=statistics.mean(agg),
+            maxmin=max(mean.values()) / min(mean.values()),
+            cv=per_cv,
+            rho=per_rho,
+            ctrl=ctrl,
+            ctrl_mean=ctrl_mean,
+            fastest=xy[max(mean, key=mean.get)],
+            cls={c: statistics.mean(v) for c, v in cls.items() if v},
+            maxlink=max(load.values()) if load else 0.0,
+        )
+    sd_cv = pooled_sd([r["cv"] for r in res.values()])
+    sd_rho = pooled_sd([r["rho"] for r in res.values()])
+    out = [
+        f"Pooled SD of a repeat's CV {sd_cv:.4f}; of rho {sd_rho:.3f}. Control = E1 v3 alone rates (another process).",
+        "",
+        "| config | k | mean GB/s (÷ control mean) | aggregate GB/s | max/min | CV (control) Δ SD | ρ(req hops, rate) | fastest (phys)"
+        " | class means row / other | max resp. link GB/s |",
+        "|---|--:|--:|--:|--:|---|---|---|---|--:|",
+    ]
+    for name, r in res.items():
+        c = statistics.mean(r["cv"]) if r["cv"] else None
+        cvs = "—" if c is None else f"{c:.3f}"
+        if c is not None and r["ctrl"]:
+            cc = statistics.mean(r["ctrl"])
+            cvs += f" ({cc:.3f}) {(c - cc) / sd_cv:+.1f}"
+        rho = f"{statistics.mean(r['rho']):+.2f}" if r["rho"] else "—"
+        ratio = f" ({r['mean'] / r['ctrl_mean']:.2f})" if r["ctrl_mean"] else ""
+        cl = " / ".join(f"{r['cls'][c]:.2f}" if c in r["cls"] else "—" for c in ("row", "other"))
+        out.append(
+            f"| {name} | {r['k']} | {r['mean']:.2f}{ratio} | {r['agg']:.1f} | {r['maxmin']:.2f} | {cvs} | {rho} |"
+            f" {r['fastest']} | {cl} | {r['maxlink']:.1f} |"
+        )
+    if dup_rows:
+        d = defaultdict(list)
+        for r in dup_rows:
+            d[r["name"]].append(r)
+        for name, reps in d.items():
+            m = [statistics.mean(c["rate"] for c in r["cores"].values()) for r in reps]
+            cvd = [cv([c["rate"] for c in r["cores"].values()]) for r in reps]
+            out.append(
+                f"\nSecond process, {name}: mean {statistics.mean(m):.2f} GB/s (first {res[name]['mean']:.2f}),"
+                f" CV {statistics.mean(cvd):.3f} (first {statistics.mean(res[name]['cv']):.3f})"
+            )
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -375,6 +472,11 @@ def main():
     if a.group == "e2v3":
         dup = a.dir / "e2v3_dup.json"
         text = e2v3(rows, json.loads(dup.read_text()) if dup.exists() else None)
+    elif a.group == "e3":
+        dup = a.dir / "e3_dup.json"
+        text = e3(
+            rows, json.loads((a.dir / "e1v3.json").read_text()), json.loads(dup.read_text()) if dup.exists() else None
+        )
     elif a.group == "p1_ep":
         dup = a.dir / "p1_ep_dup" / "p1_ep.json"
         text = p1_ep(rows, json.loads(dup.read_text()) if dup.exists() else None)
