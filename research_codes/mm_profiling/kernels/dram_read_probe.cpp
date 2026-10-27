@@ -32,6 +32,8 @@
 //   19 bank-0 endpoint override: translated x | y << 6 (0: the default endpoint); like the production knob
 //      TT_MM1D_IN1_BANK0_XY (record §9.2e E6b arm iv). Acts only with compile-time arg 0 bit 0 (remap) or bit 1
 //      (table)
+//   Compile-time arg 0 bit 2 (rot, E8): mode 1 request g goes to bank (9 + (g / 8) % 4) % 8, i.e. args 8 = dwell
+//      (requests per bank visit) and 9 = first bank; consecutive addresses within each bank
 //   Compile-time arg 0 bit 1 (table): every request's NoC address is a per-bank base from an 8-entry table built
 //      once before the stream, with 18 / 19 applied in the table, so every request costs the same whatever the
 //      endpoint. The remap path (bit 0) slows bank-0 requests by 10% even with no override (record §9.2e p1_ref)
@@ -142,6 +144,7 @@ void kernel_main() {
     const uint32_t block_bytes = reqs * req_bytes;
     constexpr bool kRemap = get_compile_time_arg_val(0) & 1;
     constexpr bool kTable = get_compile_time_arg_val(0) & 2;
+    constexpr bool kRot = get_compile_time_arg_val(0) & 4;  // mode 1 rotates banks per dwell (E8 aggressors)
     const uint32_t redirect_src = redirect >> 8, redirect_dst = redirect & 0xff;
     uint64_t bank_base[NUM_DRAM_BANKS_PROBE];
     if constexpr (kTable) {
@@ -169,6 +172,10 @@ void kernel_main() {
                 const uint32_t page = (p3 + g / p2) * p0 + p1 + g % p2;
                 bank = page % NUM_DRAM_BANKS_PROBE;
                 addr = base + (page / NUM_DRAM_BANKS_PROBE) * req_bytes;
+            } else if constexpr (kRot) {
+                // E8 rotating aggressor: dwell p0 requests on bank p1 + j (mod 8) for dwell j, j cycling over 4 banks
+                bank = (p1 + (g / p0) % 4) % NUM_DRAM_BANKS_PROBE;
+                addr = base + p3 + ((g / (4 * p0)) * p0 + g % p0) * p2;
             } else {
                 bank = (p1 + g % p0) % NUM_DRAM_BANKS_PROBE;
                 addr = base + p3 + (g / p0) * p2;

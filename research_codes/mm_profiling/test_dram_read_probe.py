@@ -87,6 +87,8 @@ def issued_requests(c):
     for g in range(n):
         if c["mode"] == 0:
             banks.append(((k0 + g // W) * Nt + c0 + g % W) % 8)
+        elif c.get("rot"):
+            banks.append((c0 + (g // Nt) % 4) % 8)
         else:
             banks.append((c0 + g % Nt) % 8)
     return sum(b != skip for b in banks)
@@ -178,6 +180,7 @@ class Probe:
         n_blocks = max(c["n_blocks"] for c in pacers.values())
         # compile-time: remap (bit 0) for skip, and for redirect / bank0_xy outside the table path (bit 1)
         table = any(c.get("table") for c in cfgs.values())
+        rot = any(c.get("rot") for c in cfgs.values())
         remap = any("skip" in c or (not table and ("redirect" in c or "bank0_xy" in c)) for c in cfgs.values())
         rt = ttnn.RuntimeArgs()
         for x, y in self.all:
@@ -210,7 +213,7 @@ class Probe:
                 kernel_source=KERNEL,
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=crs(self.all),
-                compile_time_args=[int(remap) | int(table) << 1],
+                compile_time_args=[int(remap) | int(table) << 1 | int(rot) << 2],
                 runtime_args=rt,
                 config=ttnn.DataMovementConfigDescriptor(
                     processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0 if noc == 0 else ttnn.NOC.NOC_1
@@ -500,6 +503,27 @@ def group_configs(p):
             for vc in (1, 2):
                 out.append((f"{pl}_agg_vc{vc}_alone", agg(pl, vc), 1, 1, 0, False))
                 out.append((f"{pl}_V_agg_vc{vc}", {**V, **agg(pl, vc)}, 1, 1, 0, False))
+        return out
+    if GROUP in ("e8", "e8_dup"):
+        # E8 redesign (record §9.2e, plan v3 changelog 55): V = logical (0, 0) reads a thin-K strip (Nt 256, columns
+        # 0-3 = banks 0-3, iw 8) over 32 blocks, barrier (bank mode 1) vs per bank (2). Four unpaced aggressors at
+        # logical (6..9, 5): none; static on bank 3; rotating over banks 0-3 every 16 requests (~ one V block), all
+        # starting together. Generator on (user decision) and off (reference).
+        V = lambda m: strip_args(256, 0, 4, 0, 32, 8) | {"bank_mode": m}  # noqa: E731
+        A = [(x, 5) for x in (6, 7, 8, 9)]
+        off = lambda i: (i % 4) * 2048 + (i // 4) * (2 << 20)  # noqa: E731
+        agg = {
+            "none": {},
+            "static": {xy: dict(bank_args(1, 3, 8192, off(i), 64, 16, 2048), free=True) for i, xy in enumerate(A)},
+            "rot": {
+                xy: dict(bank_args(16, 0, 2048, i << 20, 64, 16, 2048), free=True, rot=True) for i, xy in enumerate(A)
+            },
+        }
+        out = []
+        for paced in (True, False):
+            for a, cf in agg.items():
+                for m, arm in ((1, "barrier"), (2, "perbank")):
+                    out.append((f"{'on' if paced else 'off'}_{a}_{arm}", {(0, 0): V(m), **cf}, 1, 1, 0, paced))
         return out
     if GROUP == "e3_r10":
         # E3's inconclusive CV contrast (record §9.2e): row near / far, strided, k = 4 / 8, banks 2 / 0, plus every

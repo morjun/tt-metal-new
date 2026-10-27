@@ -521,6 +521,34 @@ def e7(rows):
     return "\n".join(out)
 
 
+def e8(rows):
+    """E8 redesign: V's (logical 0,0) rate per config, mean (SD); per (generator, aggressors) the per-bank arm's rate
+    minus the barrier arm's in pooled SDs of V's rate; aggressors' summed rate."""
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r["cores"])
+    vr = {n: [c["0,0"]["rate"] for c in reps] for n, reps in by.items()}
+    sd = pooled_sd(list(vr.values()))
+    out = [
+        f"Pooled SD of V's rate {sd:.3f} GB/s.",
+        "",
+        "| config | V GB/s (SD) | aggressors' sum GB/s |",
+        "|---|---|--:|",
+    ]
+    for name, reps in by.items():
+        agg = [sum(c["rate"] for k, c in r.items() if k != "0,0") for r in reps]
+        v = vr[name]
+        out.append(f"| {name} | {statistics.mean(v):.2f} ({statistics.stdev(v):.2f}) | {statistics.mean(agg):.1f} |")
+    out.append("")
+    for gen in ("on", "off"):
+        for agg in ("none", "static", "rot"):
+            b, p = vr.get(f"{gen}_{agg}_barrier"), vr.get(f"{gen}_{agg}_perbank")
+            if b and p:
+                d = statistics.mean(p) - statistics.mean(b)
+                out.append(f"generator {gen}, aggressors {agg}: per-bank − barrier {d:+.3f} GB/s ({d / sd:+.1f} SD)")
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -552,6 +580,7 @@ def main():
             "p1_tab": p1_ep,
             "e4pc": e4pc,
             "e7": e7,
+            "e8": e8,
         }[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)
