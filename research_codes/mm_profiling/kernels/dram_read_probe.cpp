@@ -35,7 +35,13 @@
 //   Compile-time arg 0 bit 1 (table): every request's NoC address is a per-bank base from an 8-entry table built
 //      once before the stream, with 18 / 19 applied in the table, so every request costs the same whatever the
 //      endpoint. The remap path (bit 0) slows bank-0 requests by 10% even with no override (record §9.2e p1_ref)
-//   20..23 reserved (0)
+//   20 bank mode (mode 0, depth 1; E8, record §9.2e): 0 = as above; 1 = barrier, issued bank by bank, one transaction
+//      ID per bank, then one barrier per block; 2 = per bank: each bank's tiles of block b are issued once that bank's
+//      block b - 1 arrived (depth 1 per bank, its own transaction ID), independent of the other banks. Modes 1 and 2
+//      issue with identical per-request work. A block is logged done when every bank has delivered it; paced, it is
+//      consumed then (in0-valid permitting) and a bank may run ahead to consumed + 2. Needs Nt % 8 == 0 (the bank of
+//      a strip column is the same in every K row)
+//   21..23 reserved (0)
 // sync words (16 B apart: a NoC write keeps the source's offset within 16 B): [0] consumed counter (on the sender),
 //   [4] in0-valid (on each reader, set by the sender's multicast), [8] the sender's multicast source
 // Records (uint32): [0] n_blocks, [1] t_start (before the first issue), [2] t_end (final barrier returned = last word
@@ -109,6 +115,7 @@ void kernel_main() {
     const uint32_t skip_bank = get_arg_val<uint32_t>(17);
     const uint32_t redirect = get_arg_val<uint32_t>(18);
     const uint32_t bank0_xy = get_arg_val<uint32_t>(19);
+    const uint32_t bank_mode = get_arg_val<uint32_t>(20);
     volatile tt_l1_ptr uint32_t* sync = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_addr);
     if (!enabled) {
         return;
@@ -196,7 +203,101 @@ void kernel_main() {
         r[3] = NOC_STATUS_READ_REG(noc_index, NIU_MST_RD_DATA_WORD_RECEIVED);
     };
 
-    if (depth <= 1) {
+    // E8 bank modes: this core's tiles of block b in bank k, under transaction ID k + 1
+    auto issue_bank = [&](uint32_t b, uint32_t k) {
+        noc_async_read_set_trid(k + 1, noc_index);
+        for (uint32_t i = 0; i < reqs; ++i) {
+            const uint32_t g = b * reqs + i;
+            const uint32_t page = (p3 + g / p2) * p0 + p1 + g % p2;
+            if (page % NUM_DRAM_BANKS_PROBE != k) {
+                continue;
+            }
+            const uint64_t src =
+                get_noc_addr_from_bank_id<true>(k, base + (page / NUM_DRAM_BANKS_PROBE) * req_bytes, noc_index);
+            noc_async_read(src, dst + (i * req_bytes) % SCRATCH_BYTES, req_bytes, noc_index);
+        }
+    };
+    bool has_bank[NUM_DRAM_BANKS_PROBE] = {};
+    for (uint32_t w = 0; bank_mode != 0 && w < p2 && w < NUM_DRAM_BANKS_PROBE; ++w) {  // mode 0 only: p2 = W
+        has_bank[(p1 + w) % NUM_DRAM_BANKS_PROBE] = true;
+    }
+
+    if (depth <= 1 && bank_mode != 0) {
+        const uint64_t consumed_sem = get_noc_addr(sender_xy >> 16, sender_xy & 0xffff, sync_addr, noc_index);
+        uint32_t consumed = 0;
+        auto consume_up_to = [&](uint32_t n) {  // blocking: consume blocks [consumed, n)
+            while (consumed < n) {
+                wait_at_least(sync + 4, consumed + 1, rec);
+                ++consumed;
+                noc_semaphore_inc(consumed_sem, 1, noc_index);
+            }
+        };
+        if (bank_mode == 1) {
+            for (uint32_t b = 0; b < n_blocks; ++b) {
+                if (paced && b >= 2) {
+                    consume_up_to(b - 1);
+                }
+                rec[REC_BLOCKS + 4 * b] = get_timestamp_32b();
+                for (uint32_t k = 0; k < NUM_DRAM_BANKS_PROBE; ++k) {
+                    if (has_bank[k]) {
+                        issue_bank(b, k);
+                    }
+                }
+                while (!ncrisc_noc_reads_flushed(noc_index)) {
+                    poll_first();
+                }
+                invalidate_l1_cache();
+                log_done(b);
+            }
+        } else {
+            uint32_t next[NUM_DRAM_BANKS_PROBE] = {}, done[NUM_DRAM_BANKS_PROBE] = {};
+            bool busy[NUM_DRAM_BANKS_PROBE] = {};
+            uint32_t logged = 0, first_issued = 0;
+            const uint32_t t0 = get_timestamp_32b();
+            while (logged < n_blocks) {
+                uint32_t low = n_blocks;
+                for (uint32_t k = 0; k < NUM_DRAM_BANKS_PROBE; ++k) {
+                    if (!has_bank[k]) {
+                        continue;
+                    }
+                    if (busy[k] && ncrisc_noc_read_with_transaction_id_flushed(noc_index, k + 1)) {
+                        busy[k] = false;
+                        ++done[k];
+                    }
+                    if (!busy[k] && next[k] < n_blocks && (!paced || next[k] < consumed + 2)) {
+                        if (next[k] == first_issued) {
+                            rec[REC_BLOCKS + 4 * first_issued++] = get_timestamp_32b();
+                        }
+                        issue_bank(next[k]++, k);
+                        busy[k] = true;
+                    }
+                    low = done[k] < low ? done[k] : low;
+                }
+                for (; logged < low; ++logged) {
+                    invalidate_l1_cache();
+                    log_done(logged);
+                }
+                if (paced) {
+                    invalidate_l1_cache();
+                    while (consumed < logged && sync[4] >= consumed + 1) {
+                        ++consumed;
+                        noc_semaphore_inc(consumed_sem, 1, noc_index);
+                    }
+                }
+                poll_first();
+                if (get_timestamp_32b() - t0 > SPIN_LIMIT_TICKS) {
+                    rec[3] = 1;
+                    break;
+                }
+            }
+        }
+        noc_async_read_set_trid(0, noc_index);
+        rec[2] = get_timestamp_32b();
+        if (paced) {
+            consume_up_to(n_blocks);
+            noc_async_atomic_barrier(noc_index);
+        }
+    } else if (depth <= 1) {
         const uint64_t consumed_sem = get_noc_addr(sender_xy >> 16, sender_xy & 0xffff, sync_addr, noc_index);
         uint32_t consumed = 0;
         auto consume_up_to = [&](uint32_t n) {  // consume blocks [consumed, n)

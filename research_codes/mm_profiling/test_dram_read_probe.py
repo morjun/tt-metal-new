@@ -172,8 +172,10 @@ class Probe:
             memory_config=self.l1_mc(SYNC_BYTES),
         )
         sync_addr = sync.buffer_address()
-        sender = min(cfgs, key=lambda xy: (xy[1], xy[0])) if paced else None
-        n_blocks = max(c["n_blocks"] for c in cfgs.values())
+        # "free" cores (E8 aggressors) run unpaced inside a paced run: not in the multicast rectangles or the ack count
+        pacers = {xy: c for xy, c in cfgs.items() if not c.get("free")}
+        sender = min(pacers, key=lambda xy: (xy[1], xy[0])) if paced else None
+        n_blocks = max(c["n_blocks"] for c in pacers.values())
         # compile-time: remap (bit 0) for skip, and for redirect / bank0_xy outside the table path (bit 1)
         table = any(c.get("table") for c in cfgs.values())
         remap = any("skip" in c or (not table and ("redirect" in c or "bank0_xy" in c)) for c in cfgs.values())
@@ -184,7 +186,8 @@ class Probe:
                 rt[x][y] = [0] * NARGS
                 continue
             assert c["n_blocks"] <= MAX_BLOCKS and c["req_bytes"] <= 16384
-            assert not paced or c.get("depth", depth) == 1
+            assert not paced or c.get("free") or c.get("depth", depth) == 1
+            assert not c.get("bank_mode") or (c["mode"] == 0 and c["p"][0] % 8 == 0 and c.get("depth", depth) == 1)
             sx, sy = self.tr[sender] if paced else (0, 0)
             a = [1, c["mode"], self.base, c["n_blocks"], c["reqs"], c["req_bytes"], c.get("depth", depth)]
             a += [
@@ -193,8 +196,14 @@ class Probe:
                 self.scratch.buffer_address(),
                 self.rec.buffer_address(),
             ]
-            a += [int(paced), sx << 16 | sy, sync_addr, c.get("skip", 0xFF), c.get("redirect", 0xFFFF)]
-            a += [c.get("bank0_xy", 0)]
+            a += [
+                int(paced and not c.get("free")),
+                sx << 16 | sy,
+                sync_addr,
+                c.get("skip", 0xFF),
+                c.get("redirect", 0xFFFF),
+            ]
+            a += [c.get("bank0_xy", 0), c.get("bank_mode", 0)]
             rt[x][y] = a + [0] * (NARGS - len(a))
         kernels = [
             ttnn.KernelDescriptor(
@@ -210,7 +219,7 @@ class Probe:
         ]
         rect_info = None
         if paced:
-            rect_info = self.rects(cfgs)
+            rect_info = self.rects(pacers)
             st = self.tr[sender]
             packed, nd = [], []
             for (x0, y0, x1, y1), n in rect_info:
@@ -219,7 +228,7 @@ class Probe:
                 inside = x0 <= st[0] <= x1 and y0 <= st[1] <= y1
                 nd.append(n | (1 << 31) if inside else n)
             buf = self.in0buf.buffer_address()
-            sa = [1, n_blocks, len(cfgs), sync_addr, buf, buf + IN0_BLOCK, IN0_BLOCK, len(packed)]
+            sa = [1, n_blocks, len(pacers), sync_addr, buf, buf + IN0_BLOCK, IN0_BLOCK, len(packed)]
             sa += packed + [0] * (4 - len(packed)) + nd + [0] * (4 - len(nd))
             srt = ttnn.RuntimeArgs()
             srt[sender[0]][sender[1]] = sa
@@ -250,8 +259,8 @@ class Probe:
                 rects=rect_info,
                 in0_valid={f"{x},{y}": int(sw[self.all.index((x, y))][4]) for x, y in cfgs},
             )
-            assert not s[16], f"in0 sender wait timed out: consumed {s[0]} of {n_blocks * len(cfgs)}"
-            assert s[0] == n_blocks * len(cfgs), f"consumed {s[0]} != {n_blocks * len(cfgs)}"
+            assert not s[16], f"in0 sender wait timed out: consumed {s[0]} of {n_blocks * len(pacers)}"
+            assert s[0] == n_blocks * len(pacers), f"consumed {s[0]} != {n_blocks * len(pacers)}"
         out = {}
         for i, xy in enumerate(self.all):
             if xy not in cfgs:
