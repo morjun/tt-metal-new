@@ -53,11 +53,16 @@ def _configs():
             mcast_in0=True,
         )
 
-    return [
+    out = [
         ("down_proj_8x4", 8192, 1024, derive_decode_1d_config(32, 8192, 1024)),
         ("gate_proj_8x8", 1024, 8192, derive_decode_1d_config(32, 1024, 8192)),
         ("gate_proj_86", 1024, 8192, wide(1024, 8192, 3)),
     ]
+    if os.getenv("EP_TAIL"):
+        # the 59,840-column pin's DRAM tail (1024 x 202,304) on its best config, 66 / ow6 (lm_head_out_block_w_config):
+        # 96 cores, the last with 52 valid columns of 66 (it also reads tiles past N)
+        out = [("lm_tail_66_6", 1024, 202304, "tail")]
+    return out
 
 
 @parametrize_mesh_with_fabric(mesh_shapes=[(1, 1)], device_params_extra={"trace_region_size": 200_000_000})
@@ -84,9 +89,16 @@ def test_endpoint_swap(mesh_device):
                 w_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=md, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
 
+            ck = ckc
+            if isinstance(pc, str):
+                from models.demos.gemma4.tt.matmul_tuning import lm_head_out_block_w_config
+
+                os.environ["EP_TAIL_OBW"], os.environ["EP_TAIL_PCN"] = "6", "66"
+                pc, ck = lm_head_out_block_w_config("EP_TAIL_OBW", x, w)
+
             def f():
                 return ttnn.linear(
-                    x, w, program_config=pc, compute_kernel_config=ckc, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                    x, w, program_config=pc, compute_kernel_config=ck, memory_config=ttnn.DRAM_MEMORY_CONFIG
                 )
 
             warm = [f() for _ in range(INNER)]
