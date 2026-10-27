@@ -360,7 +360,9 @@ def main():
         dup = a.dir / "p1_ep_dup" / "p1_ep.json"
         text = p1_ep(rows, json.loads(dup.read_text()) if dup.exists() else None)
     else:
-        text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2, "gate2": gate2, "e1v3": e1v3}[a.group](rows)
+        text = {"gate": gate, "gate_ls": gate, "e1": e1, "e2": e2, "gate2": gate2, "e1v3": e1v3, "p1_ref": p1_ep}[
+            a.group
+        ](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)
 

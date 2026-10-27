@@ -377,6 +377,16 @@ def group_configs(p):
         for tag, xy in (("e11", 0), ("e00", 17 | 12 << 6), ("e01", 17 | 13 << 6)):
             out += [(f"full_{tag}", ep(fat, xy), 1, 1, 0, False), (f"b0only_{tag}", ep(only(0), xy), 1, 1, 0, False)]
         return out + [("b1only", ep(only(1), 0), 1, 1, 0, False)]
+    if GROUP == "p1_ref":
+        # E0 (ii) (one bank's 4 fat-K readers alone) with and without the remap path compiled in, banks 0 / 1 / 4:
+        # does the p1_ep bank-0 deficit reproduce without remap (record §9.2e)?
+        fat, _ = matmul_strips(8192, 1024)
+        only = lambda b: {k: v for k, v in fat.items() if k[0] == b}  # noqa: E731
+        out = []
+        for b in (0, 1, 4):
+            out += [(f"b{b}only", only(b), 1, 1, 0, False)]
+            out += [(f"b{b}only_remap", {k: dict(v, bank0_xy=0) for k, v in only(b).items()}, 1, 1, 0, False)]
+        return out
     if GROUP == "e1v3":
         out = []
         for xy in p.all:
