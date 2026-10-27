@@ -403,6 +403,28 @@ def e3_configs(p):
     return out
 
 
+def _e8_configs():
+    """E8 configs (record §9.2e, changelog 55); see group e8."""
+    # E8 redesign (record §9.2e, plan v3 changelog 55): V = logical (0, 0) reads a thin-K strip (Nt 256, columns
+    # 0-3 = banks 0-3, iw 8) over 32 blocks, barrier (bank mode 1) vs per bank (2). Four unpaced aggressors at
+    # logical (6..9, 5): none; static on bank 3; rotating over banks 0-3 every 16 requests (~ one V block), all
+    # starting together. Generator on (user decision) and off (reference).
+    V = lambda m: strip_args(256, 0, 4, 0, 32, 8) | {"bank_mode": m}  # noqa: E731
+    A = [(x, 5) for x in (6, 7, 8, 9)]
+    off = lambda i: (i % 4) * 2048 + (i // 4) * (2 << 20)  # noqa: E731
+    agg = {
+        "none": {},
+        "static": {xy: dict(bank_args(1, 3, 8192, off(i), 64, 16, 2048), free=True) for i, xy in enumerate(A)},
+        "rot": {xy: dict(bank_args(16, 0, 2048, i << 20, 64, 16, 2048), free=True, rot=True) for i, xy in enumerate(A)},
+    }
+    out = []
+    for paced in (True, False):
+        for a, cf in agg.items():
+            for m, arm in ((1, "barrier"), (2, "perbank")):
+                out.append((f"{'on' if paced else 'off'}_{a}_{arm}", {(0, 0): V(m), **cf}, 1, 1, 0, paced))
+    return out
+
+
 def group_configs(p):
     """[(name, cfgs, depth, vc, noc, paced)] for GROUP."""
     if GROUP == "debug_rect":
@@ -519,27 +541,19 @@ def group_configs(p):
             ("on_m1", {(0, 0): V(1)}, 1, 1, 0, True),
             ("on_m2", {(0, 0): V(2)}, 1, 1, 0, True),
         ]
-    if GROUP in ("e8", "e8_dup"):
-        # E8 redesign (record §9.2e, plan v3 changelog 55): V = logical (0, 0) reads a thin-K strip (Nt 256, columns
-        # 0-3 = banks 0-3, iw 8) over 32 blocks, barrier (bank mode 1) vs per bank (2). Four unpaced aggressors at
-        # logical (6..9, 5): none; static on bank 3; rotating over banks 0-3 every 16 requests (~ one V block), all
-        # starting together. Generator on (user decision) and off (reference).
-        V = lambda m: strip_args(256, 0, 4, 0, 32, 8) | {"bank_mode": m}  # noqa: E731
-        A = [(x, 5) for x in (6, 7, 8, 9)]
-        off = lambda i: (i % 4) * 2048 + (i // 4) * (2 << 20)  # noqa: E731
-        agg = {
-            "none": {},
-            "static": {xy: dict(bank_args(1, 3, 8192, off(i), 64, 16, 2048), free=True) for i, xy in enumerate(A)},
-            "rot": {
-                xy: dict(bank_args(16, 0, 2048, i << 20, 64, 16, 2048), free=True, rot=True) for i, xy in enumerate(A)
-            },
-        }
+    if GROUP in ("e8_ord", "e8_ord_dup"):
+        # E8 follow-up (record §9.2e): barrier with fixed bank order (mode 1) vs rotated order (mode 3) vs per bank (2)
         out = []
-        for paced in (True, False):
-            for a, cf in agg.items():
-                for m, arm in ((1, "barrier"), (2, "perbank")):
-                    out.append((f"{'on' if paced else 'off'}_{a}_{arm}", {(0, 0): V(m), **cf}, 1, 1, 0, paced))
+        for name, cfgs, d, vc, noc, paced in _e8_configs():
+            if name.endswith("_barrier"):
+                v = cfgs[(0, 0)]
+                out.append((name.replace("_barrier", "_m1"), cfgs, d, vc, noc, paced))
+                out.append((name.replace("_barrier", "_m3"), {**cfgs, (0, 0): dict(v, bank_mode=3)}, d, vc, noc, paced))
+            else:
+                out.append((name.replace("_perbank", "_m2"), cfgs, d, vc, noc, paced))
         return out
+    if GROUP in ("e8", "e8_dup"):
+        return _e8_configs()
     if GROUP == "e3_r10":
         # E3's inconclusive CV contrast (record §9.2e): row near / far, strided, k = 4 / 8, banks 2 / 0, plus every
         # endpoint-row core alone on its bank in the same process (second control)

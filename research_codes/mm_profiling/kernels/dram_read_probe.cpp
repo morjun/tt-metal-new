@@ -42,7 +42,8 @@
 //      block b - 1 arrived (depth 1 per bank, its own transaction ID), independent of the other banks. Modes 1 and 2
 //      issue with identical per-request work. A block is logged done when every bank has delivered it; paced, it is
 //      consumed then (in0-valid permitting) and a bank may run ahead to consumed + 2. Needs Nt % 8 == 0 (the bank of
-//      a strip column is the same in every K row)
+//      a strip column is the same in every K row). 3 = barrier as 1, but block b's banks are issued starting at the
+//      (b mod n)-th of the core's n banks (E8 follow-up: in mode 1 the same bank is always issued last)
 //   21..23 reserved (0)
 // sync words (16 B apart: a NoC write keeps the source's offset within 16 B): [0] consumed counter (on the sender),
 //   [4] in0-valid (on each reader, set by the sender's multicast), [8] the sender's multicast source
@@ -240,16 +241,21 @@ void kernel_main() {
                 noc_semaphore_inc(consumed_sem, 1, noc_index);
             }
         };
-        if (bank_mode == 1) {
+        if (bank_mode == 1 || bank_mode == 3) {
+            uint32_t banks[NUM_DRAM_BANKS_PROBE], nb = 0;
+            for (uint32_t k = 0; k < NUM_DRAM_BANKS_PROBE; ++k) {
+                if (has_bank[k]) {
+                    banks[nb++] = k;
+                }
+            }
             for (uint32_t b = 0; b < n_blocks; ++b) {
                 if (paced && b >= 2) {
                     consume_up_to(b - 1);
                 }
                 rec[REC_BLOCKS + 4 * b] = get_timestamp_32b();
-                for (uint32_t k = 0; k < NUM_DRAM_BANKS_PROBE; ++k) {
-                    if (has_bank[k]) {
-                        issue_bank(b, k);
-                    }
+                const uint32_t first = bank_mode == 3 ? b % nb : 0;  // mode 3: no bank is issued last every block
+                for (uint32_t j = 0; j < nb; ++j) {
+                    issue_bank(b, banks[(first + j) % nb]);
                 }
                 while (!ncrisc_noc_reads_flushed(noc_index)) {
                     poll_first();

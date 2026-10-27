@@ -549,6 +549,28 @@ def e8(rows):
     return "\n".join(out)
 
 
+def e8_ord(rows):
+    """E8 follow-up: V's rate for barrier fixed order (m1), barrier rotated order (m3) and per bank (m2) per
+    (generator, aggressors); contrasts m3 - m1 and m2 - m3 in pooled SDs of V's rate."""
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r["cores"]["0,0"]["rate"])
+    sd = pooled_sd(list(by.values()))
+    m = {k: statistics.mean(v) for k, v in by.items()}
+    out = [f"Pooled SD of V's rate {sd:.3f} GB/s.", "", "| generator, aggressors | m1 | m3 | m2 | m3 − m1 | m2 − m3 |"]
+    out.append("|---|--:|--:|--:|--:|--:|")
+    for gen in ("on", "off"):
+        for agg in ("none", "static", "rot"):
+            a1, a3, a2 = (m.get(f"{gen}_{agg}_m{i}") for i in (1, 3, 2))
+            if None in (a1, a3, a2):
+                continue
+            out.append(
+                f"| {gen}, {agg} | {a1:.2f} | {a3:.2f} | {a2:.2f} | {a3 - a1:+.2f} ({(a3 - a1) / sd:+.1f} SD) |"
+                f" {a2 - a3:+.2f} ({(a2 - a3) / sd:+.1f} SD) |"
+            )
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -581,6 +603,7 @@ def main():
             "e4pc": e4pc,
             "e7": e7,
             "e8": e8,
+            "e8_ord": e8_ord,
         }[a.group](rows)
     (a.dir / f"{a.group}_summary.md").write_text(text + "\n")
     print(text)
