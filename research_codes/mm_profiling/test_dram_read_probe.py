@@ -177,6 +177,10 @@ class Probe:
         # "free" cores (E8 aggressors) run unpaced inside a paced run: not in the multicast rectangles or the ack count
         pacers = {xy: c for xy, c in cfgs.items() if not c.get("free")}
         sender = min(pacers, key=lambda xy: (xy[1], xy[0])) if paced else None
+        if paced and len(pacers) == 1:
+            # one paced reader: the sender would multicast with loopback to a 1 x 1 rectangle holding only itself, which
+            # hung the device (E8, 2026-10-28). Put the sender on an idle worker outside the rectangle instead.
+            sender = next(xy for xy in self.all if xy not in cfgs)
         n_blocks = max(c["n_blocks"] for c in pacers.values())
         # compile-time: remap (bit 0) for skip, and for redirect / bank0_xy outside the table path (bit 1)
         table = any(c.get("table") for c in cfgs.values())
@@ -504,6 +508,17 @@ def group_configs(p):
                 out.append((f"{pl}_agg_vc{vc}_alone", agg(pl, vc), 1, 1, 0, False))
                 out.append((f"{pl}_V_agg_vc{vc}", {**V, **agg(pl, vc)}, 1, 1, 0, False))
         return out
+    if GROUP == "e8_dbg":
+        # staged check of the E8 paths after the 2026-10-28 hang: unpaced bank modes, then one paced reader with the
+        # sender outside its rectangle (legacy mode 0, then bank modes 1 / 2)
+        V = lambda m: strip_args(256, 0, 4, 0, 32, 8) | ({"bank_mode": m} if m else {})  # noqa: E731
+        return [
+            ("off_m1", {(0, 0): V(1)}, 1, 1, 0, False),
+            ("off_m2", {(0, 0): V(2)}, 1, 1, 0, False),
+            ("on_m0", {(0, 0): V(0)}, 1, 1, 0, True),
+            ("on_m1", {(0, 0): V(1)}, 1, 1, 0, True),
+            ("on_m2", {(0, 0): V(2)}, 1, 1, 0, True),
+        ]
     if GROUP in ("e8", "e8_dup"):
         # E8 redesign (record §9.2e, plan v3 changelog 55): V = logical (0, 0) reads a thin-K strip (Nt 256, columns
         # 0-3 = banks 0-3, iw 8) over 32 blocks, barrier (bank mode 1) vs per bank (2). Four unpaced aggressors at
@@ -591,6 +606,7 @@ def test_dram_read_probe(mesh_device):
         return
     groups = group_configs(p)
     for name, cfgs, depth, vc, noc, paced in groups:  # warm-up, discarded (plan v3 G3)
+        logger.info(f"[probe] warm-up {name}")  # names the config if a launch hangs
         p.run(cfgs, depth, vc, noc, paced)
     rows = []
     for rep in range(REPEATS):  # repeat loop outer, configs inner (plan v3 G4)
