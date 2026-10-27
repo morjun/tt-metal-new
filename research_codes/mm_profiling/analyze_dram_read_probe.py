@@ -463,6 +463,35 @@ def e3(rows, e1_rows, dup_rows=None):
     return "\n".join(out)
 
 
+def e3_r10(rows, e1_rows):
+    """E3 re-run: the E3 table for the shared-bank configs, then each config's CV against the same-process alone
+    control (the cores' alone rates in this run, per repeat)."""
+    shared = [r for r in rows if not r["name"].startswith("alone_")]
+    alone = defaultdict(list)
+    for r in rows:
+        if r["name"].startswith("alone_"):
+            _, b, px, py = r["name"].split("_")
+            alone[(int(b[1:]), int(px), int(py))].append(next(iter(r["cores"].values()))["rate"])
+    cv = lambda v: statistics.stdev(v) / statistics.mean(v)  # noqa: E731
+    phys = lambda x, y: (x + 1 if x < 6 else x + 5, y + 2)  # noqa: E731
+    by = defaultdict(list)
+    for r in shared:
+        by[r["name"]].append(r)
+    groups, lines = [], []
+    for name, reps in by.items():
+        b = int(name.split("_")[0][1:])
+        keys = list(reps[0]["cores"])
+        groups.append([cv([r["cores"][k]["rate"] for k in keys]) for r in reps])
+        al = [alone[(b, *phys(*map(int, k.split(","))))] for k in keys]
+        ctrl = [cv([a[j] for a in al]) for j in range(min(map(len, al)))]
+        lines.append((name, statistics.mean(groups[-1]), statistics.mean(ctrl), ctrl))
+    sd = pooled_sd(groups + [c for *_, c in lines])
+    out = [e3(shared, e1_rows), "", f"Same-process alone control (pooled SD of a repeat's CV {sd:.4f}):", ""]
+    out += ["| config | CV | same-process alone CV | Δ SD |", "|---|--:|--:|--:|"]
+    out += [f"| {n} | {c:.4f} | {a:.4f} | {(c - a) / sd:+.1f} |" for n, c, a, _ in lines]
+    return "\n".join(out)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dir", type=Path)
@@ -477,6 +506,8 @@ def main():
         text = e3(
             rows, json.loads((a.dir / "e1v3.json").read_text()), json.loads(dup.read_text()) if dup.exists() else None
         )
+    elif a.group == "e3_r10":
+        text = e3_r10(rows, json.loads((a.dir / "e1v3.json").read_text()))
     elif a.group == "p1_ep":
         dup = a.dir / "p1_ep_dup" / "p1_ep.json"
         text = p1_ep(rows, json.loads(dup.read_text()) if dup.exists() else None)

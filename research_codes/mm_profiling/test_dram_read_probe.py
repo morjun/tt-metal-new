@@ -474,6 +474,16 @@ def group_configs(p):
             ("AB_Ahigh", {A: burst(0, 15), B: burst(1 << 19, 0)}, 4, 1, 0, False),
             ("AB_Bhigh", {A: burst(0, 0), B: burst(1 << 19, 15)}, 4, 1, 0, False),
         ]
+    if GROUP == "e3_r10":
+        # E3's inconclusive CV contrast (record §9.2e): row near / far, strided, k = 4 / 8, banks 2 / 0, plus every
+        # endpoint-row core alone on its bank in the same process (second control)
+        keep = {f"b{b}_row_{o}_str_k{k}" for b in (2, 0) for o in ("near", "far") for k in (4, 8)}
+        out = [c for c in e3_configs(p) if c[0] in keep]
+        for b, py in ((2, 9), (0, 11)):
+            for px in (15, 14, 13, 12, 11, 6, 5, 4, 3, 2, 1):
+                xy = (px - 1 if px <= 6 else px - 5, py - 2)
+                out.append((f"alone_b{b}_{px}_{py}", {xy: bank_args(1, b, 8192, 0, 32, 8, 2048)}, 1, 1, 0, False))
+        return out
     if GROUP in ("e3", "e3_dup"):
         out = e3_configs(p)
         return out if GROUP == "e3" else [c for c in out if c[0] == "b2_row_near_str_k8"]
