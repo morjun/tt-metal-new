@@ -9,6 +9,8 @@ link demand is its congestion MODEL over the same transfers.
          gate_proj read in 16 blocks instead of 4, down_proj (32 cores), global-layer qkv (48 cores)
   fig16  tt-npe's modelled demand per NoC link for the same gate_proj: map of the busiest link at each router,
          and over time the grid average against the busiest link
+  fig16b_split  fig16b's two runs as separate figures (fig16b1 NoC0 default, fig16b2 NoC1 swapped)
+  fig16c fig16 before and after the access-point swap (bank 0 read through (0, 0); cells in npe_ep0)
 
     python research_codes/mm_profiling/plot_dram_read_grid.py [--out DIR]
 """
@@ -306,9 +308,17 @@ def npe_panel(fig, ax, busiest, ends, vmax, title):
     )
     for (r, c), v in busiest.items():
         if c in DRAM_COLS and v >= 5:
-            ax.add_patch(Rectangle((c - 0.45, r - 0.45), 0.9, 0.9, color=ORANGES(min(v / vmax, 1.0)), lw=0))
+            # above grid()'s plain "D" label, which would otherwise show through next to this one
+            ax.add_patch(Rectangle((c - 0.45, r - 0.45), 0.9, 0.9, color=ORANGES(min(v / vmax, 1.0)), lw=0, zorder=4))
             ax.text(
-                c, r, f"D\n{v:.0f}", ha="center", va="center", fontsize=5.5, color=SURFACE if v / vmax > 0.45 else INK
+                c,
+                r,
+                f"D\n{v:.0f}",
+                ha="center",
+                va="center",
+                fontsize=5.5,
+                color=SURFACE if v / vmax > 0.45 else INK,
+                zorder=5,
             )
 
 
@@ -515,6 +525,132 @@ recorded transfers, not a measurement of the links.
     save(fig, out, "fig16b_npe_link_demand_noc_swap", desc)
 
 
+def fig16b_split(out):
+    """fig16b as two figures, one per run (NoC0 default, NoC1 swapped), each a map plus that run's busiest link
+    and average over time; both keep fig16b's colour scale and y range so they compare directly."""
+    cells = CELLS.parent / "phase2_nocswap"
+    runs = [
+        ("NoC0 (default)", cells / "04_noc_B+logitsl1", "fig16b1_npe_link_demand_noc0_default"),
+        ("NoC1 (swapped)", cells / "05_noc_B+logitsl1+nocswap", "fig16b2_npe_link_demand_noc1_swapped"),
+    ]
+    k = 32
+
+    def smooth(y):
+        return np.convolve(y, np.ones(k) / k, mode="same")
+
+    def hot_label(hot):
+        r, c, kind = hot
+        dr, dc = NPE_LINKS[kind]
+        return f"row {r}, column {c} → row {r + dr}, column {c + dc}"
+
+    for name, cell, stem in runs:
+        d = npeviz(cell, "gate_proj (sliding)", 0)
+        _, ends = dram_reads(d)
+        mean, busiest, hot, us, avg, hot_t = npe_link_means(d)
+        over = sum(1 for v in mean.values() if v > 100)
+        fig = plt.figure(figsize=(15, 6.6))
+        gs = fig.add_gridspec(1, 2, width_ratios=[1.15, 1])
+        ax = fig.add_subplot(gs[0])
+        npe_panel(fig, ax, busiest, ends, 400.0, f"{name}: busiest link into each router")
+        colorbar(fig, ax, ORANGES, 400.0, "modelled link demand, % of the link's bandwidth")
+        ax2 = fig.add_subplot(gs[1])
+        ax2.plot(us, smooth(hot_t), color=ORANGE, lw=2, label=f"busiest link ({hot_label(hot)})")
+        ax2.plot(us, smooth(avg), color=BLUE, lw=2, label="average over all links")
+        ax2.axhline(100, color=AXIS, lw=1, ls=(0, (1, 2)))
+        ax2.set_xlabel("time since the matmul started, us")
+        ax2.set_ylabel("modelled demand, % of the link's bandwidth")
+        ax2.set_ylim(0, 620)
+        ax2.legend(loc="upper right", fontsize=9, frameon=False)
+        ax2.set_title("Busiest link and average over all links", fontsize=11)
+        if "swapped" in stem:
+            body = f"""The weight reads travel on network 1, which routes up the column first, then along the row. The responses
+now leave each bank northwards up its DRAM column, and the four banks of a column share that column's
+vertical links ("D" squares with a number: links leading into a DRAM-column router).
+Busiest: {hot_label(hot)}, {mean[hot]:.0f}% on average over the matmul; {over} links above 100%.
+With the networks swapped, every DRAM-fed matmul read its weights 30-44% slower in total (43-78% longer
+matmuls) than with the default (fig16b1)."""
+        else:
+            body = f"""The weight reads travel on network 0 (the default), which routes along the row first, then down the column.
+The hot links leave the DRAM columns ("D"; dark = endpoints that served reads) eastwards along their rows.
+Busiest: {hot_label(hot)}, {mean[hot]:.0f}% on average over the matmul; {over} links above 100%.
+fig16b2 is the same matmul with the networks swapped, from the same session and on the same colour scale."""
+        desc = f"""
+The congestion model's view (tt-npe) of one weight-read matmul (gate_proj of a sliding-window layer, 64 cores,
+weights read from DRAM), {name.split(" ")[0]} run. The model replays every recorded transfer in 32-cycle steps; a
+link's demand is the sum of the bandwidth every in-flight transfer routed through it tries to use, as a
+percentage of the link's bandwidth in the model.
+
+- Left: for every router, the busiest link leading into it, averaged over the matmul.
+- Right: over time, the busiest link (orange) and the average over all links (blue).
+
+{body}
+
+This is a model of the recorded transfers, not a measurement of the links.
+"""
+        save(fig, out, stem, desc)
+
+
+def fig16c(out):
+    """fig16 after the access-point swap: gate_proj L0 on 64 cores, default endpoints vs bank 0 read through (0, 0)
+    (TT_MM1D_IN1_BANK0_XY), two noc cells of one session (npe_ep0), one scale."""
+    cells = CELLS.parent / "npe_ep0"
+    runs = [("Default endpoints", cells / "00_noc_B"), ("Access-point swap", cells / "01_noc_B+ep0")]
+    data = []
+    for name, cell in runs:
+        d = npeviz(cell, "gate_proj (sliding)", 0)
+        _, ends = dram_reads(d)
+        data.append((name, ends) + npe_link_means(d))
+    k = 32
+
+    def smooth(y):
+        return np.convolve(y, np.ones(k) / k, mode="same")
+
+    def hot_label(hot):
+        r, c, kind = hot
+        dr, dc = NPE_LINKS[kind]
+        return f"row {r}, column {c} → row {(r + dr) % ROWS}, column {(c + dc) % COLS}"
+
+    vmax = 200.0
+    fig = plt.figure(figsize=(18, 6.6))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.95])
+    for i, (name, ends, mean, busiest, hot, us, avg, hot_t) in enumerate(data):
+        ax = fig.add_subplot(gs[i])
+        over = sum(1 for v in mean.values() if v > 100)
+        npe_panel(fig, ax, busiest, ends, vmax, f"{name}\nbusiest link {mean[hot]:.0f}%, {over} links above 100%")
+        colorbar(fig, ax, ORANGES, vmax, "modelled link demand, % of the link's bandwidth")
+    ax3 = fig.add_subplot(gs[2])
+    for (name, _, mean, _, hot, us, avg, hot_t), color in zip(data, (BLUE, ORANGE)):
+        ax3.plot(us, smooth(hot_t), color=color, lw=2, label=f"{name}, busiest link")
+        ax3.plot(us, smooth(avg), color=color, lw=1.3, ls=(0, (4, 2)), label=f"{name}, average over all links")
+    ax3.axhline(100, color=AXIS, lw=1, ls=(0, (1, 2)))
+    ax3.set_xlabel("time since the matmul started, us")
+    ax3.set_ylabel("modelled demand, % of the link's bandwidth")
+    ax3.set_ylim(0, 300)
+    ax3.legend(loc="upper right", fontsize=9, frameon=False)
+    ax3.set_title("Busiest link (solid) and average over all links (dashed)", fontsize=11)
+    (n0, _, m0, _, h0, us0, *_), (n1, _, m1, _, h1, us1, *_) = data
+    over0 = sum(1 for v in m0.values() if v > 100)
+    over1 = sum(1 for v in m1.values() if v > 100)
+    desc = f"""
+The congestion model's view (tt-npe) of the same weight-read matmul as fig16 (gate_proj of a sliding-window
+layer, 64 cores, weights read from DRAM) in two runs from one session: the default, and the same run with
+DRAM bank 0 read through its unused endpoint in the top-left corner instead of its default endpoint in the
+bottom row (the access-point swap; same bank, same data, same bytes). By default, bank 0's responses and most
+of bank 4's leave through the same eastbound link in the bottom row; after the swap, bank 0's responses enter
+the network in the top row instead. The model replays every recorded transfer in 32-cycle steps; a link's
+demand is the sum of the bandwidth every in-flight transfer routed through it tries to use, as a percentage of
+the link's bandwidth in the model. Both maps use the same colour scale.
+
+- Left, default: busiest link {hot_label(h0)}, {m0[h0]:.0f}% on average over the matmul; {over0} links above 100%.
+- Middle, access-point swap: busiest link {hot_label(h1)}, {m1[h1]:.0f}% on average; {over1} links above 100%.
+- Right: over time, the busiest link of each run (solid) and the average over all links (dashed).
+  The matmul's recorded transfers span {us0[-1]:.1f} us by default and {us1[-1]:.1f} us after the swap.
+
+This is a model of the recorded transfers, not a measurement of the links.
+"""
+    save(fig, out, "fig16c_npe_link_demand_ap_swap", desc)
+
+
 def fig17(out):
     a = GRIDWIDE / "06_noc_B+logitsl1"
     wide = GRIDWIDE / "07_noc_B+logitsl1+gridwide"
@@ -568,7 +704,7 @@ bandwidth. Tracing slows the matmuls a little, so the absolute values are lower 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default="fig15,fig16,fig16b,fig17,fig18,fig19")
+    p.add_argument("--only", default="fig15,fig16,fig16b,fig16b_split,fig16c,fig17,fig18,fig19")
     args = p.parse_args()
     for name in args.only.split(","):
         globals()[name](args.out)
