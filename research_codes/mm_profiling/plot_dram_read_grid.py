@@ -10,6 +10,7 @@ link demand is its congestion MODEL over the same transfers.
   fig16  tt-npe's modelled demand per NoC link for the same gate_proj: map of the busiest link at each router,
          and over time the grid average against the busiest link
   fig16b_split  fig16b's two runs as separate figures (fig16b1 NoC0 default, fig16b2 NoC1 swapped)
+  fig22  P3: lm_head cores served in row order inside every K-step block, aggregate rate flat, no end tail
   fig16c fig16 before and after the access-point swap (bank 0 read through (0, 0); cells in npe_ep0)
 
     python research_codes/mm_profiling/plot_dram_read_grid.py [--out DIR]
@@ -651,6 +652,109 @@ This is a model of the recorded transfers, not a measurement of the links.
     save(fig, out, "fig16c_npe_link_demand_ap_swap", desc)
 
 
+def lm_head_progress(cell):
+    """Per-core service lag of the whole-DRAM drafter lm_head: at every 1/16 of a core's reads (progress
+    checkpoints, first and last excluded), how long after the first core it issues that read, averaged; plus the
+    aggregate issue rate in 10 us bins and when the final drain starts. Issue times from the NoC trace."""
+    from scipy.stats import spearmanr
+
+    reads, ends = dram_reads(npeviz(cell, "lm_head (whole, DRAM)", None, 0))
+    t0 = min(t for t, _, _ in reads)
+    per = defaultdict(list)
+    for t, _, rc in reads:
+        per[rc].append(t - t0)
+    full = max(len(v) for v in per.values())  # cores reading the full 75 columns (the last cores read fewer)
+    step = full // 16
+    cores = {rc: sorted(v) for rc, v in per.items() if len(v) == full}
+    lag = defaultdict(list)
+    for k in range(2, 16):
+        at = {rc: v[k * step - 1] for rc, v in cores.items()}
+        first = min(at.values())
+        for rc, t in at.items():
+            lag[rc].append(t - first)
+    lag = {rc: float(np.mean(v)) for rc, v in lag.items()}
+    rho = spearmanr([rc[0] for rc in lag], list(lag.values()))[0]
+    last = [v[-1] for v in cores.values()]
+    edges = np.arange(0, max(last) + 10, 10)
+    hist, _ = np.histogram([t for v in per.values() for t in v], bins=edges)
+    rate = hist * 2048 / 10e3  # GB/s per 10 us bin
+    body = rate[(edges[:-1] > 20) & (edges[:-1] < max(last) * 0.85)]
+    drain = edges[:-1][(rate < 0.5 * np.median(body)) & (edges[:-1] > max(last) * 0.5)].min()
+    left = [sum(1 for t in v if t >= drain) for v in cores.values()]
+    return dict(
+        lag=lag,
+        ends=ends,
+        rho=rho,
+        edges=edges,
+        rate=rate,
+        body=float(np.median(body)),
+        drain=drain,
+        left=(min(left), max(left)),
+        span=max(last),
+        spread=max(last) - min(last),
+    )
+
+
+def fig22(out):
+    """P3 evidence: the drafter lm_head (whole head in DRAM, 110 cores) serves its cores in row order, yet the
+    cores end together and the aggregate read rate is flat; default endpoints (fig16's cell A0) and after the
+    access-point swap (npe_ep0/00_noc_B+ep0, another session)."""
+    runs = [("Default endpoints", A0), ("Access-point swap", CELLS.parent / "npe_ep0" / "00_noc_B+ep0")]
+    data = [(name, lm_head_progress(cell)) for name, cell in runs]
+    fig = plt.figure(figsize=(19, 6.4))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.9])
+    vmax = 12.0
+    for i, (name, r) in enumerate(data):
+        ax = fig.add_subplot(gs[i])
+        grid(
+            ax,
+            r["lag"],
+            BLUES,
+            vmax,
+            r["ends"],
+            f"{name}: delay behind the first core\nSpearman rho with row {r['rho']:.2f}",
+            fs=6.5,
+        )
+        colorbar(fig, ax, BLUES, vmax, "delay behind the first core at the same point of its reads, us")
+    ax3 = fig.add_subplot(gs[2])
+    for (name, r), color in zip(data, (BLUE, ORANGE)):
+        ax3.plot(r["edges"][:-1] + 5, r["rate"], color=color, lw=1.8, label=name)
+    ax3.set_xlabel("time since the matmul started, us")
+    ax3.set_ylabel("DRAM read rate of all 110 cores, GB/s (10 us bins)")
+    ax3.set_ylim(0, 560)
+    ax3.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, fontsize=9, frameon=False)
+    ax3.set_title("Aggregate read rate over the matmul", fontsize=11)
+    rows = range(2, 12)
+
+    def per_row(r):
+        return ", ".join(f"{np.median([v for rc, v in r['lag'].items() if rc[0] == y]):.1f}" for y in rows)
+
+    (n0, r0), (n1, r1) = data
+    desc = f"""
+The drafter's output projection (lm_head, whole weight read from DRAM, 110 cores, 75 weight columns per core),
+one profiled run each with the default DRAM endpoints and with the access-point swap (bank 0 read through its
+unused endpoint), from two sessions. Every core issues its weight reads in the same order and the cores move
+through the matmul together.
+
+- Left and middle: for every core, how long after the first core it reaches the same point of its reads (checked
+  at every 1/16 of its reads, averaged). Per row from top (row 2) to bottom (row 11), in us:
+  default {per_row(r0)};
+  access-point swap {per_row(r1)}.
+  Cores farther down the chip are served first (Spearman rho between row and delay {r0['rho']:.2f} / {r1['rho']:.2f}), and the
+  order is still there after the swap. Grey cells: the last cores, which read fewer columns; "D": DRAM
+  columns, dark = endpoints that served reads.
+- Right: the read rate of all cores together stays flat while the weight streams ({r0['body']:.0f} GB/s by default,
+  {r1['body']:.0f} after the swap; median over 10 us bins), and the cores' last reads lie within {r0['spread']:.1f} / {r1['spread']:.1f} us of
+  each other. So the row order does not leave some rows behind at the end. With the default endpoints the
+  last ~{r0['span'] - r0['drain']:.0f} us run at about a quarter of the rate, with every core (every row alike) still issuing its last
+  {r0['left'][0]}-{r0['left'][1]} reads; after the swap this slow end is gone. The matmul's reads span {r0['span']:.0f} us by default and
+  {r1['span']:.0f} us after the swap.
+
+Times are the issue times of the read requests recorded by the NoC trace, not arrival times.
+"""
+    save(fig, out, "fig22_lm_head_row_order", desc)
+
+
 def fig17(out):
     a = GRIDWIDE / "06_noc_B+logitsl1"
     wide = GRIDWIDE / "07_noc_B+logitsl1+gridwide"
@@ -701,10 +805,90 @@ bandwidth. Tracing slows the matmuls a little, so the absolute values are lower 
     save(fig, out, "fig17_dram_read_rate_grid_wide", desc)
 
 
+def fig17c(out):
+    """fig17 after the access-point swap: the wide grid (86 / 96 cores) without (fig17's cell) and with bank 0 read
+    through (0, 0) (npe_ep0_wide/00_noc_B+gridwide+ep0, another session). Per-core rate early in the op and each
+    core's last read: the row order of service, and the end tail it leaves."""
+    from scipy.stats import spearmanr
+
+    runs = [
+        ("Wide grid", GRIDWIDE / "07_noc_B+logitsl1+gridwide"),
+        ("Wide grid + AP swap", CELLS.parent / "npe_ep0_wide" / "00_noc_B+gridwide+ep0"),
+    ]
+    fig = plt.figure(figsize=(17, 10.2))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 0.04], hspace=0.32, wspace=0.08)
+    axs = np.array([[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(2)])
+    rows_txt = []
+    for i, (name, cell) in enumerate(runs):
+        g, ends = dram_reads(npeviz(cell, "gate_proj (sliding)", 0))
+        q, ends_q = dram_reads(npeviz(cell, "qkv_proj (global)"))
+        g_rate, q_rate = per_core_rate(g, 0, 12), per_core_rate(q, 0, 15)
+        g_last = defaultdict(float)
+        for t, _, c in g:
+            g_last[c] = max(g_last[c], t)
+        rho_g = spearmanr([c[0] for c in g_rate], list(g_rate.values()))[0]
+        rho_l = spearmanr([c[0] for c in g_last], list(g_last.values()))[0]
+        rho_q = spearmanr([c[0] for c in q_rate], list(q_rate.values()))[0]
+        last = sorted(g_last.values())
+        grid(axs[i, 0], g_rate, BLUES, 12.0, ends, f"{name}\ngate_proj read rate, 0-12 us (rho with row {rho_g:+.2f})")
+        grid(
+            axs[i, 1],
+            dict(g_last),
+            ORANGES,
+            50.0,
+            ends,
+            f"{name}\ngate_proj last read, us (rho with row {rho_l:+.2f})",
+            fmt="{:.0f}",
+        )
+        grid(
+            axs[i, 2], q_rate, BLUES, 12.0, ends_q, f"{name}\nglobal qkv read rate, 0-15 us (rho with row {rho_q:+.2f})"
+        )
+        per_row = lambda d: ", ".join(f"{np.median([v for c, v in d.items() if c[0] == y]):.1f}" for y in range(2, 10))
+        rows_txt.append(
+            f"- {name}: gate_proj rate in the first 12 us per row 2-9: {per_row(g_rate)} GB/s (rho {rho_g:+.2f});"
+            f"\n  last read per row 2-9: {per_row(dict(g_last))} us (rho {rho_l:+.2f}); first core done at {last[0]:.1f} us,"
+            f"\n  last at {last[-1]:.1f} us (end tail {last[-1] - last[0]:.1f} us); global qkv rho {rho_q:+.2f}."
+        )
+    for c, (cmap, vmax, label) in enumerate(
+        [
+            (BLUES, 12.0, "DRAM read rate per core, GB/s"),
+            (ORANGES, 50.0, "time of the core's last read, us"),
+            (BLUES, 12.0, "DRAM read rate per core, GB/s"),
+        ]
+    ):
+        cb = fig.colorbar(
+            plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, vmax)),
+            cax=fig.add_subplot(gs[2, c]),
+            orientation="horizontal",
+        )
+        cb.set_label(label, color=INK2, fontsize=10)
+        cb.outline.set_visible(False)
+        cb.ax.tick_params(labelsize=9, colors=MUTED)
+    nl = "\n"
+    desc = f"""
+The same per-core maps as fig17 (backbone matmuls on the wide grid: gate_proj of a sliding-window layer on 86
+cores, the global layer's qkv on 96), without and with the access-point swap (bank 0 read through its unused
+endpoint), one profiled run each, from two sessions. Each square is one compute core; "D" squares are the
+DRAM columns, the dark ones the endpoints that served the reads.
+
+- Left and right columns: how fast each core pulled its weights early in the matmul (GB/s), before any core
+  has finished.
+- Middle column: when each core issued its last weight read; the spread between the first and the last core
+  is the end tail.
+
+{nl.join(rows_txt)}
+
+Lower rows are still served first after the swap: the row order of service remains, and it still leaves the
+upper rows reading last. Rates are issued bytes per second from a per-transfer trace of one profiled run;
+times are request issue times, not arrival times.
+"""
+    save(fig, out, "fig17c_dram_read_rate_grid_wide_ap_swap", desc)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    p.add_argument("--only", default="fig15,fig16,fig16b,fig16b_split,fig16c,fig17,fig18,fig19")
+    p.add_argument("--only", default="fig15,fig16,fig16b,fig16b_split,fig16c,fig17,fig17c,fig18,fig19,fig22")
     args = p.parse_args()
     for name in args.only.split(","):
         globals()[name](args.out)
