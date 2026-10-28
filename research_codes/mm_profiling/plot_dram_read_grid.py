@@ -591,10 +591,10 @@ This is a model of the recorded transfers, not a measurement of the links.
 
 
 def fig16c(out):
-    """fig16 after the access-point swap: gate_proj L0 on 64 cores, default endpoints vs bank 0 read through (0, 0)
-    (TT_MM1D_IN1_BANK0_XY), two noc cells of one session (npe_ep0), one scale."""
-    cells = CELLS.parent / "npe_ep0"
-    runs = [("Default endpoints", cells / "00_noc_B"), ("Access-point swap", cells / "01_noc_B+ep0")]
+    """fig16 after the access-point swap: gate_proj L0 on 64 cores, default endpoints (fig16's cell A0) vs bank 0 read
+    through (0, 0) (TT_MM1D_IN1_BANK0_XY; cell npe_ep0/00_noc_B+ep0, 2026-10-28), one scale. The two cells come from
+    different sessions; A0 also has the logits in L1, which does not touch gate_proj."""
+    runs = [("Default endpoints", A0), ("Access-point swap", CELLS.parent / "npe_ep0" / "00_noc_B+ep0")]
     data = []
     for name, cell in runs:
         d = npeviz(cell, "gate_proj (sliding)", 0)
@@ -625,15 +625,15 @@ def fig16c(out):
     ax3.axhline(100, color=AXIS, lw=1, ls=(0, (1, 2)))
     ax3.set_xlabel("time since the matmul started, us")
     ax3.set_ylabel("modelled demand, % of the link's bandwidth")
-    ax3.set_ylim(0, 300)
-    ax3.legend(loc="upper right", fontsize=9, frameon=False)
+    ax3.set_ylim(0, max(smooth(x[7]).max() for x in data) * 1.08)
+    ax3.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, fontsize=9, frameon=False)
     ax3.set_title("Busiest link (solid) and average over all links (dashed)", fontsize=11)
     (n0, _, m0, _, h0, us0, *_), (n1, _, m1, _, h1, us1, *_) = data
     over0 = sum(1 for v in m0.values() if v > 100)
     over1 = sum(1 for v in m1.values() if v > 100)
     desc = f"""
 The congestion model's view (tt-npe) of the same weight-read matmul as fig16 (gate_proj of a sliding-window
-layer, 64 cores, weights read from DRAM) in two runs from one session: the default, and the same run with
+layer, 64 cores, weights read from DRAM) in two runs: fig16's default run, and a later run with
 DRAM bank 0 read through its unused endpoint in the top-left corner instead of its default endpoint in the
 bottom row (the access-point swap; same bank, same data, same bytes). By default, bank 0's responses and most
 of bank 4's leave through the same eastbound link in the bottom row; after the swap, bank 0's responses enter
