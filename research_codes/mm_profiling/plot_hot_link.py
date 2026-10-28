@@ -5,9 +5,9 @@ fig20_dram_endpoints: the P150 NoC grid (physical NoC0 coordinates) with every D
 bank's NoC0 endpoint, its NoC1 endpoint or unused (tt_metal/soc_descriptors/blackhole_140_arch.yaml), the Tensix
 compute grid, and the response link (0, 11) -> (1, 11) that banks 0 and 4 share.
 
-fig21_hot_link_load: per drafter matmul layout, the static response load on the most loaded NoC0 link in units of
-one bank's response bytes (H4 routes, noc_routes.py; columns assigned row-major, bank = column mod 8), split by the
-bank it comes from, with the default endpoints and with bank 0 read through (0, 0).
+fig21_hot_link_load: per drafter matmul layout, the static response load on two fixed NoC0 links, (0, 11) -> (1, 11)
+and (0, 0) -> (1, 0), with the default endpoints and with bank 0 read through (0, 0), in units of one bank's response
+bytes (H4 routes, noc_routes.py; columns assigned row-major, bank = column mod 8), split by the bank it comes from.
 
     python research_codes/mm_profiling/plot_hot_link.py <figures dir>
 """
@@ -127,72 +127,79 @@ def hot_contributions(Nt, pcn, gx, ncores, ep0):
 
 
 def fig_hot_link(out):
+    """Per layout, the response load on two fixed NoC0 links, default endpoints vs the access-point swap (bank 0 read
+    through (0, 0)): (0, 11) -> (1, 11), shared by banks 0 and 4 by default, and (0, 0) -> (1, 0), bank 0's first
+    link after the swap. Split by source bank. Returns, per layout and condition, the chip-wide busiest link and both fixed links' loads.
+    """
     cfgs = [
         ("fat-K\n8 × 4, 32 cores", (32, 1, 8, 32)),
         ("thin-K\n8 × 8, 64 cores", (256, 4, 8, 64)),
         ("thin-K, wide\n86 cores", (256, 3, 11, 86)),
         ("lm_head\n110 cores", (8192, 75, 11, 110)),
     ]
-    fig, ax = plt.subplots(figsize=(9.6, 4.6), facecolor=SURFACE)
-    ax.set_facecolor(SURFACE)
+    links = [((11, 0, "NOC0_EAST"), "link (0, 11) → (1, 11)"), ((0, 0, "NOC0_EAST"), "link (0, 0) → (1, 0)")]
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.0), facecolor=SURFACE, sharey=True)
     rows = []
-    for k, (name, cfg) in enumerate(cfgs):
-        for j, ep0 in enumerate((False, True)):
-            c = hot_contributions(*cfg, ep0)
-            link = max(c, key=lambda lk: sum(c[lk].values()))
-            b0, b4 = c[link].get(0, 0.0), c[link].get(4, 0.0)
-            other = sum(c[link].values()) - b0 - b4
-            yv = k * 2.6 + j * 1.0
-            left = 0.0
-            for val, col in ((b0, BLUE), (b4, ORANGE), (other, GRAY)):
-                if val > 0:
-                    ax.barh(yv, val - 0.02, left=left, height=0.78, color=col, edgecolor="none")
-                    left += val
-            ax.text(left + 0.04, yv, f"{left:.2f}", va="center", fontsize=9.5, color=INK)
-            ax.text(
-                -0.06,
-                yv,
-                "bank 0 via (0, 0)" if ep0 else "default endpoints",
-                va="center",
-                ha="right",
-                fontsize=9,
-                color=INK2,
-            )
-            rows.append((name.replace("\n", " "), ep0, left, b0, b4))
-        ax.text(
-            -0.36,
-            k * 2.6 + 0.5,
-            name,
-            va="center",
-            ha="right",
-            fontsize=10,
-            color=INK,
-            weight="bold",
-            transform=ax.get_yaxis_transform(),
-        )
-    ax.axvline(1.0, color=INK2, lw=0.8, ls=(0, (3, 3)))
-    ax.set_xlim(0, 2.35)
-    ax.set_ylim(k * 2.6 + 1.6, -0.6)
-    ax.set_yticks([])
-    ax.set_xlabel("load on the most loaded NoC0 response link (in units of one bank's response bytes)", color=INK2)
-    ax.tick_params(colors=INK2)
-    for s in ("top", "right", "left"):
-        ax.spines[s].set_visible(False)
-    ax.spines["bottom"].set_color(GRAY)
+    for ax, (key, title) in zip(axes, links):
+        ax.set_facecolor(SURFACE)
+        for k, (name, cfg) in enumerate(cfgs):
+            for j, ep0 in enumerate((False, True)):
+                c = hot_contributions(*cfg, ep0)
+                load = c.get(key, {})
+                b0, b4 = load.get(0, 0.0), load.get(4, 0.0)
+                other = sum(load.values()) - b0 - b4
+                yv = k * 2.6 + j * 1.0
+                left = 0.0
+                for val, col in ((b0, BLUE), (b4, ORANGE), (other, GRAY)):
+                    if val > 0:
+                        ax.barh(yv, val - 0.02, left=left, height=0.78, color=col, edgecolor="none")
+                        left += val
+                ax.text(left + 0.04, yv, f"{left:.2f}", va="center", fontsize=9.5, color=INK)
+                if ax is axes[0]:
+                    ax.text(-0.06, yv, "AP swap" if ep0 else "default", va="center", ha="right", fontsize=9, color=INK2)
+                    busiest = max(c, key=lambda lk: sum(c[lk].values()))
+                    rows.append((name.replace("\n", " "), ep0, busiest, sum(c[busiest].values())))
+                rows.append((name.replace("\n", " "), ep0, key, left))
+            if ax is axes[0]:
+                ax.text(
+                    -0.20,
+                    k * 2.6 + 0.5,
+                    name,
+                    va="center",
+                    ha="right",
+                    fontsize=10,
+                    color=INK,
+                    weight="bold",
+                    transform=ax.get_yaxis_transform(),
+                )
+        ax.axvline(1.0, color=INK2, lw=0.8, ls=(0, (3, 3)))
+        ax.set_xlim(0, 2.35)
+        ax.set_ylim(len(cfgs) * 2.6 - 1.0, -0.6)
+        ax.set_yticks([])
+        ax.set_title(title, fontsize=11, color=INK)
+        ax.set_xlabel("response load, in units of one bank's response bytes", color=INK2)
+        ax.tick_params(colors=INK2)
+        for sp in ("top", "right", "left"):
+            ax.spines[sp].set_visible(False)
+        ax.spines["bottom"].set_color(GRAY)
     handles = [Rectangle((0, 0), 1, 1, facecolor=col) for col in (BLUE, ORANGE)]
-    ax.legend(handles, ["from bank 0", "from bank 4"], loc="lower right", frameon=False, fontsize=9)
+    axes[1].legend(handles, ["from bank 0", "from bank 4"], loc="lower right", frameon=False, fontsize=9)
     fig.tight_layout()
-    fig.subplots_adjust(left=0.40)
+    fig.subplots_adjust(left=0.19, wspace=0.08)
     for ext in ("png", "pdf"):
         fig.savefig(out / f"fig21_hot_link_load.{ext}", dpi=200, facecolor=SURFACE)
     (out / "fig21_hot_link_load.txt").write_text(
-        "Static response load on the most loaded NoC0 link for each drafter matmul layout, in units of one DRAM "
-        "bank's response bytes (each bank holds 1/8 of a weight). With the default endpoints that link is "
-        "(0, 11) -> (1, 11): it carries all of bank 0's responses plus the share of bank 4's that wraps west-to-east "
-        "to the cores in columns x 1-6 (all of it for fat-K, whose bank-4 readers sit in x 5; 75% for the 8 x 8 "
-        "thin-K grid; 56% for the 86-core thin-K grid; 55% for the lm_head). Reading bank 0 through (0, 0) leaves "
-        "every link at most one bank's bytes. Routes: dimension order (east, then south) on the torus, validated "
-        "against tt-npe; bytes per core from the matmul's column assignment.\n"
+        "Static response load on two fixed NoC0 links, with the default DRAM endpoints and with the access-point "
+        "swap (bank 0 read through its unused endpoint (0, 0) instead of (0, 11)), for each drafter matmul layout. "
+        "Unit: one DRAM bank's response bytes (each bank holds 1/8 of a weight). Left: the eastbound link "
+        "(0, 11) -> (1, 11). By default it carries all of bank 0's responses plus the share of bank 4's that "
+        "wraps west-to-east to the cores in columns x 1-6: all of it for fat-K, whose bank-4 readers sit in x 5; "
+        "75% for the 8 x 8 thin-K grid; 56% for the 86-core thin-K grid; 55% for the lm_head. After the swap only "
+        "bank 4's share is left on it. Right: the eastbound link (0, 0) -> (1, 0), bank 0's first link after the "
+        "swap. It carries bank 0's responses, and nothing by default. With the swap no link on the chip carries "
+        "more than one bank's bytes; by default the busiest link is (0, 11) -> (1, 11) at 1.55-2.00. Routes: "
+        "dimension order (east, then south) on the torus, validated against tt-npe; bytes per core from the "
+        "matmul's column assignment. A static byte count, not a measurement.\n"
     )
     plt.close(fig)
     return rows
