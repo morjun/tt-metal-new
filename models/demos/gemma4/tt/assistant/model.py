@@ -402,6 +402,37 @@ class Gemma4AssistantModel:
             [k, cols // cores],
             ttnn.ShardOrientation.ROW_MAJOR,
         )
+        reserve = os.getenv("GEMMA4_LMHEAD_L1_RESERVE_B", "")
+        if reserve:
+            # RESEARCH (gemma4-12b record §9.4 S2; HYBRID allocator mode only): "<tiles>:<prefix cores>" reserves
+            # <tiles> N tiles per core, allocated per core, on the cores outside the row-major prefix of
+            # <prefix cores> (where the per-core pins are), before the slice: the room a second head slice ("B")
+            # would occupy. A placeholder for allocation checks: its columns stay in the DRAM tail.
+            from models.demos.gemma4.tt.weight_placement import l1_core_addresses, prefix_core_range_set
+
+            tiles, prefix = (int(v) for v in reserve.split(":"))
+            inside = {(c.x, c.y) for c in ttnn.corerange_to_cores(prefix_core_range_set(prefix, grid.x))}
+            outside = [(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in inside]
+            rmc = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(
+                    ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(*c), ttnn.CoreCoord(*c)) for c in outside]),
+                    [k, tiles * T],
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                ),
+            )
+            rmc.experimental_set_per_core_allocation(True)
+            self.lm_head_l1_reserve_b = ttnn.allocate_tensor_on_device(
+                ttnn.Shape([1, 1, k, tiles * T * len(outside)]), self.lm_head.dtype, ttnn.TILE_LAYOUT, mesh_device, rmc
+            )
+            addrs = set(l1_core_addresses(self.lm_head_l1_reserve_b).values())
+            if len(addrs) != 1:
+                raise RuntimeError(f"[lm_head-split] slice-B reservation: non-uniform addresses {sorted(addrs)}")
+            logger.info(
+                f"[lm_head-split] slice-B reservation: {tiles} tiles/core per-core on {len(outside)} cores outside "
+                f"the {prefix}-core prefix, at {addrs.pop()}"
+            )
         pinned = ttnn.to_memory_config(
             head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
         )

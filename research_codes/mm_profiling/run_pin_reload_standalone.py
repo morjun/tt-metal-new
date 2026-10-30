@@ -78,23 +78,30 @@ def arm_spec(arm):
     per_core_N instead of the tuner's, r = gather_in0 ring), e.g. "B+logitsl1+pindown_proj@0r". A "+fatk_dram_ring"
     suffix runs the fat-K matmuls (o_proj, down_proj; the ring guard refuses pre_projection) as the gather_in0 ring
     with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2). "+blkfatk<cap>" / "+blkwide<cap>" cap
-    in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
+    in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). A pin suffix ending in "c" allocates that pin
+    per core (GEMMA4_L1_PIN ":pc", needs "+hybrid"); "+resB<tiles>" reserves <tiles> head tiles per core, per-core,
+    on the cores outside the 86-core prefix (GEMMA4_LMHEAD_L1_RESERVE_B, record §9.4 S2). "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
     NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in). A trailing "+hybrid" opens the device in
     the HYBRID allocator mode (TT_METAL_ALLOCATOR_MODE_HYBRID, record §9.4); it is stripped before every other suffix.
     """
     if arm.endswith("+hybrid"):
         base, extra, width = arm_spec(arm[: -len("+hybrid")])
         return base, {**extra, "TT_METAL_ALLOCATOR_MODE_HYBRID": "1"}, width
+    m = re.search(r"\+resB(\d+)$", arm)
+    if m:
+        # per-core reservation of <tiles> head tiles on the cores outside the 86-core pin prefix (record §9.4 S2)
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "GEMMA4_LMHEAD_L1_RESERVE_B": f"{m.group(1)}:86"}, width
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
         spec, ring = [], False
         for pin in pins:
-            m = re.fullmatch(r"([a-z_]+)(?:@([\d-]+))?(?:p(\d+))?(r)?", pin)
+            m = re.fullmatch(r"([a-z_]+)(?:@([\d-]+))?(?:p(\d+))?(r)?(c)?", pin)
             if not m:
                 raise SystemExit(f"unknown pin {pin!r} in {arm}")
-            name, layers, pcn, r = m.groups()
-            spec.append(name + (f"@{layers}" if layers else "") + (f":{pcn}" if pcn else ""))
+            name, layers, pcn, r, c = m.groups()
+            spec.append(name + (f"@{layers}" if layers else "") + (f":{pcn}" if pcn else "") + (":pc" if c else ""))
             ring |= bool(r)
         extra = {
             **extra,

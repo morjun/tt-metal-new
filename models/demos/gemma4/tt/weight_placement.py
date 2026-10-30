@@ -75,15 +75,19 @@ def _parse_layer_spec(spec):
 
 
 def _parse_pin_spec(spec):
-    """ "down_proj@0;gate_proj@0-3:3" -> ((substring, layers, per_core_N or None), ...)."""
+    """ "down_proj@0;gate_proj@0-3:3;up_proj@0:3:pc" -> ((substring, layers, per_core_N or None, per_core), ...).
+
+    A trailing ``:pc`` allocates the pin per core (HYBRID allocator mode only, gemma4-12b record §9.4)."""
     out = []
     for entry in (spec or "").split(";"):
         entry = entry.strip()
         if not entry:
             continue
-        head, _, pcn = entry.partition(":")
+        head, *opts = entry.split(":")
+        per_core = "pc" in opts
+        pcn = [o for o in opts if o.strip() and o != "pc"]
         sub, _, layers = head.partition("@")
-        out.append((sub.strip(), _parse_layer_spec(layers), int(pcn) if pcn.strip() else None))
+        out.append((sub.strip(), _parse_layer_spec(layers), int(pcn[0]) if pcn else None, per_core))
     return tuple(out)
 
 
@@ -169,7 +173,8 @@ class WeightPlacement:
     #: ``<substring>[@<layers>][:<per_core_N>]`` separated by ``;``, e.g.
     #: ``down_proj@0;gate_proj@0:3;post_projection:2``. ``per_core_N`` shards the weight on
     #: the row-major prefix of ceil(Nt / per_core_N) cores of the full device grid instead
-    #: of the tuner's grid (gemma4-12b record §9.2). Env: GEMMA4_L1_PIN.
+    #: of the tuner's grid (gemma4-12b record §9.2). A trailing ``:pc`` allocates that pin per core,
+    #: which needs the HYBRID allocator mode (record §9.4). Env: GEMMA4_L1_PIN.
     pins: tuple = ()
     #: Defer all sharding to an explicit post-load pass. Required for the TARGET,
     #: whose weights also serve prefill: a decode-shaped shard makes prefill's
@@ -192,6 +197,7 @@ class WeightPlacement:
         if not self.pins:
             self.pins = _parse_pin_spec(os.getenv("GEMMA4_L1_PIN", ""))
         self._pcn = {}
+        self._per_core = set()
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
@@ -242,14 +248,18 @@ class WeightPlacement:
     def _pin_for(self, name):
         """The first GEMMA4_L1_PIN entry matching this weight name, or None."""
         m = _LAYER_RE.search(name or "")
-        for sub, layers, pcn in self.pins:
+        for sub, layers, pcn, per_core in self.pins:
             if sub in name and (not layers or (m is not None and int(m.group(1)) in layers)):
-                return sub, layers, pcn
+                return sub, layers, pcn, per_core
         return None
 
     def per_core_n(self, name):
         """per_core_N override for a pinned weight (GEMMA4_L1_PIN), or None for the tuner's grid."""
         return self._pcn.get(name)
+
+    def per_core(self, name):
+        """Whether a pinned weight is allocated per core (GEMMA4_L1_PIN ``:pc``)."""
+        return name in self._per_core
 
     def _layer_allowed(self, name):
         if not self.layers:
@@ -297,6 +307,8 @@ class WeightPlacement:
                 return ttnn.DRAM_MEMORY_CONFIG
             if pin[2] is not None:
                 self._pcn[name] = pin[2]
+            if pin[3]:
+                self._per_core.add(name)
         elif self.only and not any(s in name for s in self.only):
             self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_ONLY"))
             return ttnn.DRAM_MEMORY_CONFIG
@@ -386,7 +398,16 @@ def prefix_core_range_set(num_cores, width):
     return ttnn.CoreRangeSet(set(ranges))
 
 
-def shard_l1_width(tensor, mesh_device, per_core_n=None):
+def l1_core_addresses(tensor):
+    """{(x, y): L1 address} over a sharded L1 tensor's shard cores; per-core allocations answer per core."""
+    cores = ttnn.corerange_to_cores(tensor.memory_config().shard_spec.grid, row_wise=True)
+    if tensor.is_per_core_allocated():
+        return {(c.x, c.y): tensor.experimental_per_core_buffer_address(c) for c in cores}
+    addr = tensor.buffer_address()
+    return {(c.x, c.y): addr for c in cores}
+
+
+def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False):
     """Reshard a loaded weight to L1 WIDTH_SHARDED on the matmul's compute grid.
 
     Each core ends up holding exactly the N-slice it multiplies, which is what
@@ -399,6 +420,10 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None):
 
     Returns the resharded tensor, or None when the weight does not qualify
     (ROW_MAJOR norms, shapes with no valid grid).
+
+    ``per_core`` (with ``per_core_n``; HYBRID allocator mode only, gemma4-12b record §9.4) allocates the shard per
+    core. Stock ops bind a sharded buffer at one address, so the shard must land at the same address on all its
+    cores; that is asserted.
     """
     from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
@@ -428,8 +453,20 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None):
             ttnn.BufferType.L1,
             ttnn.ShardSpec(grid, [k, per_core_n * T], ttnn.ShardOrientation.ROW_MAJOR),
         )
-        return ttnn.to_memory_config(tensor, mc)
+        if per_core:
+            mc.experimental_set_per_core_allocation(True)
+        moved = ttnn.to_memory_config(tensor, mc)
+        if per_core:
+            addrs = set(l1_core_addresses(moved).values())
+            if not moved.is_per_core_allocated() or len(addrs) != 1:
+                raise RuntimeError(
+                    f"per-core pin {list(local)}: per-core={moved.is_per_core_allocated()}, addresses {sorted(addrs)}"
+                )
+            logger.info(f"[placement] per-core pin {list(local)} at {addrs.pop()} on {cores} cores")
+        return moved
 
+    if per_core:
+        raise ValueError("a per-core pin needs an explicit per_core_N (GEMMA4_L1_PIN <name>:<per_core_N>:pc)")
     pc = derive_decode_1d_config(1, k, n)
     if pc is None:
         return None
@@ -542,7 +579,9 @@ def _place_as_tensor(
         if not wanted:
             return tensor
         try:
-            moved = shard_l1_width(tensor, device, per_core_n=placement.per_core_n(name))
+            moved = shard_l1_width(
+                tensor, device, per_core_n=placement.per_core_n(name), per_core=placement.per_core(name)
+            )
             if moved is None:
                 # Normal for norms / non-matmul weights: give the budget back and
                 # record it, but do not shout about it.

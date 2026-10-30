@@ -117,6 +117,7 @@ def register(owner, attr, device):
     # Reload core sets are snapped to two fixed sets so the trace sees a fixed set of programs: the
     # drafter global SDPA's 8x4 block (it also covers the split-logits concat on (0,0)), else all cores.
     st.small = [c for c in cores if c[0] < 8 and c[1] < 4]
+    st.extras = _find_extras(owner, head, set(st.small))
     st.snap = ttnn.allocate_tensor_on_device(
         ttnn.Shape([1, 1, len(cores) * st.pages, PAGE // 2]),
         ttnn.bfloat16,
@@ -283,8 +284,9 @@ _CORE_RANGE = re.compile(r"\[(\d+)-(\d+)\s*-\s*(\d+)-(\d+)\]")  # "[x1-y1 - x2-y
 
 
 def _cb_reach(graph, s_addr):
-    """From a ttnn graph capture: the cores whose program-local CBs end above `s_addr`, and the highest CB end."""
-    dirty, top = set(), 0
+    """From a ttnn graph capture: the cores whose program-local CBs end above `s_addr`, the highest CB end, and
+    each such core's highest CB end."""
+    dirty, top, ends = set(), 0, {}
     for node in graph:
         p = node.get("params", {})
         if node.get("node_type") != "circular_buffer_allocate" or p.get("globally_allocated") != "0":
@@ -294,8 +296,68 @@ def _cb_reach(graph, s_addr):
             continue
         top = max(top, end)
         for x1, y1, x2, y2 in _CORE_RANGE.findall(p.get("core_range_set", "")):
-            dirty.update((x, y) for y in range(int(y1), int(y2) + 1) for x in range(int(x1), int(x2) + 1))
-    return dirty, top
+            for c in ((x, y) for y in range(int(y1), int(y2) + 1) for x in range(int(x1), int(x2) + 1)):
+                dirty.add(c)
+                ends[c] = max(ends.get(c, 0), end)
+    return dirty, top, ends
+
+
+def _find_extras(root, head, cores):
+    """Other L1-sharded tensors reachable from `root` (the drafter model) that sit below the reload ceiling on any of
+    `cores` (where the bracketed ops' CBs reach): backbone pins whose bottom pages a bracketed op overwrites (gemma4-12b
+    record §9.4, partial backbone reload). Each must be freed with the head around the op and re-created after it at
+    the same addresses. Returns one dict per tensor, with every (holder, key) that refers to it, highest first."""
+    from models.demos.gemma4.tt.weight_placement import l1_core_addresses
+
+    found, seen, stack = {}, set(), [root]
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, dict):
+            items = list(obj.items())
+        elif isinstance(obj, list):
+            items = list(enumerate(obj))
+        elif hasattr(obj, "__dict__") and type(obj).__module__.startswith("models.demos.gemma4"):
+            items = list(vars(obj).items())
+        else:
+            continue
+        for key, val in items:
+            if isinstance(val, ttnn.Tensor):
+                if val is head or not val.is_allocated():
+                    continue
+                mc = val.memory_config()
+                if mc.buffer_type != ttnn.BufferType.L1 or not mc.is_sharded():
+                    continue
+                addrs = l1_core_addresses(val)
+                if not any(a < CEILING for c, a in addrs.items() if c in cores):
+                    continue
+                e = found.setdefault(id(val), {"tensor": val, "refs": [], "addrs": addrs, "mc": mc})
+                e["refs"].append((obj, key))
+            elif isinstance(val, (dict, list)) or hasattr(val, "__dict__"):
+                stack.append(val)
+    extras = sorted(found.values(), key=lambda e: -min(e["addrs"].values()))
+    for e in extras:
+        t = e["tensor"]
+        e.update(shape=t.shape, dtype=t.dtype, layout=t.layout, per_core=t.is_per_core_allocated())
+        e["lo"] = min(e["addrs"].values())
+        e["name"] = f"{type(e['refs'][0][0]).__name__}.{e['refs'][0][1]} {list(t.shape)}"
+        logger.info(
+            f"[lm-head-reload] extra buffer {e['name']}: {'per-core' if e['per_core'] else 'lockstep'} at "
+            f"{sorted(set(e['addrs'].values()))} on {len(e['addrs'])} cores, below the ceiling {CEILING}: freed and "
+            f"re-created around every bracket; {len(e['refs'])} reference(s)"
+        )
+    return extras
+
+
+def _set_refs(e, t):
+    for holder, key in e["refs"]:
+        if isinstance(holder, (dict, list)):
+            holder[key] = t
+        else:
+            object.__setattr__(holder, key, t)
+    e["tensor"] = t
 
 
 class bracket:
@@ -329,6 +391,8 @@ class bracket:
             _drisc_wait()
             logger.warning(f"[lm-head-reload] bracket '{self.tag}' entered during a DRISC reload; waited for it")
         getattr(_st.owner, _st.attr).deallocate(True)
+        for e in _st.extras:
+            e["tensor"].deallocate(True)
         if self.key not in _st.footprints:
             self.capture = True
             ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
@@ -341,7 +405,7 @@ class bracket:
             graph = ttnn.graph.end_graph_capture()
             if exc_type is not None:
                 return False
-            dirty, top = _cb_reach(graph, _st.S)
+            dirty, top, ends = _cb_reach(graph, _st.S)
             if top > CEILING:
                 raise RuntimeError(
                     f"[lm-head-reload] {self.tag}: CBs reach {top} > reload ceiling {CEILING} "
@@ -352,8 +416,25 @@ class bracket:
                 f"[lm-head-reload] bracket '{self.tag}': CBs reach into the head on {len(dirty)} cores, "
                 f"highest CB end {top} (learned from the program; cached for this input signature)"
             )
+            for e in _st.extras:
+                over = {c: ends[c] - a for c, a in e["addrs"].items() if ends.get(c, 0) > a}
+                logger.info(
+                    f"[lm-head-reload] bracket '{self.tag}': CBs overlap extra {e['name']} on {len(over)} cores"
+                    + (f", by {min(over.values())}-{max(over.values())} B" if over else "")
+                )
         elif exc_type is not None:
             return False
+        from models.demos.gemma4.tt.weight_placement import l1_core_addresses
+
+        for e in _st.extras:  # highest first: top-down allocation puts each back where it was
+            t = ttnn.allocate_tensor_on_device(e["shape"], e["dtype"], e["layout"], _st.device, e["mc"])
+            if t.is_per_core_allocated() != e["per_core"] or l1_core_addresses(t) != e["addrs"]:
+                raise RuntimeError(
+                    f"[lm-head-reload] extra {e['name']} re-created at "
+                    f"{sorted(set(l1_core_addresses(t).values()))} after {self.tag}, expected "
+                    f"{sorted(set(e['addrs'].values()))} (per-core {e['per_core']})"
+                )
+            _set_refs(e, t)
         h = ttnn.allocate_tensor_on_device(_st.shape, _st.dtype, _st.layout, _st.device, _st.mc)
         if h.buffer_address() != _st.S:
             raise RuntimeError(
