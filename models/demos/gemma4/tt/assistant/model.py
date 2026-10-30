@@ -67,6 +67,67 @@ def _lm_head_logits_memory_config():
     return ttnn.L1_MEMORY_CONFIG
 
 
+def build_head_slice_b(lm_head, start, tiles, prefix, grid, in0_block_w):
+    """RESEARCH (gemma4-12b record §9.4; HYBRID allocator mode only): head slice B.
+
+    Pins lm_head columns [start, end) per core on the cores outside the row-major prefix of ``prefix`` cores of the
+    ``grid`` (where the per-core backbone pins are), ``tiles`` x 32 columns per core. The complement of a row-major
+    prefix is at most two rectangles (the rest of the prefix's last row, then the rows below), and a stock 1D-mcast
+    matmul runs on one rectangle (``allowed_worker_cores``), so there is one slice per rectangle, in column order.
+    Each uses ``in0_block_w`` and the main slice's compute config, so every output column is summed exactly as in the
+    unsplit head. Every slice must land at one address on all its cores (stock ops bind it by one address).
+
+    Returns (((weight, program config), ...), end).
+    """
+    from models.demos.gemma4.tt.weight_placement import l1_core_addresses
+
+    T = 32
+    k = int(lm_head.shape[-2])
+    q, r = divmod(prefix, grid.x)
+    rects = []
+    if r:
+        rects.append(ttnn.CoreRange(ttnn.CoreCoord(r, q), ttnn.CoreCoord(grid.x - 1, q)))
+    if q + 1 < grid.y:
+        rects.append(ttnn.CoreRange(ttnn.CoreCoord(0, q + 1), ttnn.CoreCoord(grid.x - 1, grid.y - 1)))
+    slices, lo = [], start
+    for rc in rects:
+        gw, gh = rc.grid_size().x, rc.grid_size().y
+        hi = lo + tiles * T * gw * gh
+        src = ttnn.slice(lm_head, [0, 0, 0, lo], [1, 1, k, hi])
+        mc = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(ttnn.CoreRangeSet([rc]), [k, tiles * T], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        mc.experimental_set_per_core_allocation(True)
+        w = ttnn.to_memory_config(src, mc)
+        src.deallocate(True)
+        addrs = set(l1_core_addresses(w).values())
+        if not w.is_per_core_allocated() or len(addrs) != 1:
+            raise RuntimeError(f"[lm_head-split] slice B on {rc}: per-core addresses {sorted(addrs)}")
+        pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gw, gh),
+            in0_block_w=in0_block_w,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            out_block_h=1,
+            out_block_w=tiles,
+            per_core_M=1,
+            per_core_N=tiles,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+            allowed_worker_cores=ttnn.CoreRangeSet([rc]),
+        )
+        slices.append((w, pc))
+        logger.info(
+            f"[lm_head-split] slice B: cols [{lo}, {hi}) per-core on {rc} ({gw * gh} cores, {tiles} tiles/core) "
+            f"at {addrs.pop()}"
+        )
+        lo = hi
+    return tuple(slices), lo
+
+
 class SplitLogits(NamedTuple):
     """Dense drafter logits produced as column-ordered parts, not one row.
 
@@ -253,6 +314,7 @@ class Gemma4AssistantModel:
         self.lm_head = None
         self.lm_head_l1 = None
         self.lm_head_l1_pc = None
+        self.lm_head_l1_b = ()  # research (record §9.4): (weight, program config) per slice-B rectangle
         self.lm_head_l1_ckc = None
         self.lm_head_l1_ring = None  # (in0 spec, out spec) when the slice runs as a gather_in0 ring
         if self.use_cme:
@@ -394,7 +456,15 @@ class Gemma4AssistantModel:
             f"charge={charge} B/bank ({charge/1024:.0f} KiB)"
         )
         head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])
-        tail = ttnn.slice(self.lm_head, [0, 0, 0, cols], [1, 1, k, vocab])
+        b_slices, end = (), cols
+        slice_b = os.getenv("GEMMA4_LMHEAD_L1_SLICE_B", "")
+        if slice_b:
+            # RESEARCH (gemma4-12b record §9.4; HYBRID allocator mode only): "<tiles>:<prefix cores>"; see
+            # build_head_slice_b. Allocated before the main slice: per-core buffers go first, at the top of their cores.
+            b_tiles, prefix = (int(v) for v in slice_b.split(":"))
+            b_slices, end = build_head_slice_b(self.lm_head, cols, b_tiles, prefix, grid, blk)
+        self.lm_head_l1_b = b_slices
+        tail = ttnn.slice(self.lm_head, [0, 0, 0, end], [1, 1, k, vocab])
         self.lm_head.deallocate(True)
         self.lm_head = tail  # the DRAM remainder keeps the original attribute
         shard = ttnn.ShardSpec(
@@ -553,6 +623,16 @@ class Gemma4AssistantModel:
                         memory_config=_lm_head_logits_memory_config(),
                         compute_kernel_config=self.lm_head_l1_ckc,
                     )
+                b_parts = tuple(
+                    ttnn.linear(
+                        normed,
+                        wb,
+                        program_config=pcb,
+                        memory_config=_lm_head_logits_memory_config(),
+                        compute_kernel_config=self.lm_head_l1_ckc,
+                    )
+                    for wb, pcb in self.lm_head_l1_b
+                )
                 obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
                 tail = ttnn.linear(
                     normed,
@@ -563,8 +643,9 @@ class Gemma4AssistantModel:
                 )
                 if self.mesh_config is not None and self.mesh_config.tp > 1:
                     head = ccl_allgather(head, self.mesh_config, self.ccl_manager)
+                    b_parts = tuple(ccl_allgather(b, self.mesh_config, self.ccl_manager) for b in b_parts)
                     tail = ccl_allgather(tail, self.mesh_config, self.ccl_manager)
-                logits = SplitLogits(parts=(head, tail))
+                logits = SplitLogits(parts=(head, *b_parts, tail))
             else:
                 obw_pc, obw_ckc = lm_head_out_block_w_config("GEMMA4_LMHEAD_DRAFT_OBW", normed, self.lm_head)
                 if os.getenv("GEMMA4_LMHEAD_LOGITS_L1") == "1" and obw_pc is None:

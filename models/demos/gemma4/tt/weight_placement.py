@@ -75,9 +75,11 @@ def _parse_layer_spec(spec):
 
 
 def _parse_pin_spec(spec):
-    """ "down_proj@0;gate_proj@0-3:3;up_proj@0:3:pc" -> ((substring, layers, per_core_N or None, per_core), ...).
+    """ "down_proj@0;gate_proj@0-3:3;up_proj@0:3:pc:y4" -> ((substring, layers, per_core_N or None, per_core,
+    origin row), ...).
 
-    A trailing ``:pc`` allocates the pin per core (HYBRID allocator mode only, gemma4-12b record §9.4)."""
+    ``:pc`` allocates the pin per core (HYBRID allocator mode only); ``:y<n>`` shards it on the row-major prefix of
+    the grid's rows n and below instead of from row 0 (gemma4-12b record §9.4)."""
     out = []
     for entry in (spec or "").split(";"):
         entry = entry.strip()
@@ -85,9 +87,12 @@ def _parse_pin_spec(spec):
             continue
         head, *opts = entry.split(":")
         per_core = "pc" in opts
-        pcn = [o for o in opts if o.strip() and o != "pc"]
+        origin = [int(o[1:]) for o in opts if o.startswith("y")]
+        pcn = [o for o in opts if o.strip() and o != "pc" and not o.startswith("y")]
         sub, _, layers = head.partition("@")
-        out.append((sub.strip(), _parse_layer_spec(layers), int(pcn[0]) if pcn else None, per_core))
+        out.append(
+            (sub.strip(), _parse_layer_spec(layers), int(pcn[0]) if pcn else None, per_core, origin[0] if origin else 0)
+        )
     return tuple(out)
 
 
@@ -198,6 +203,7 @@ class WeightPlacement:
             self.pins = _parse_pin_spec(os.getenv("GEMMA4_L1_PIN", ""))
         self._pcn = {}
         self._per_core = set()
+        self._origin = {}
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
@@ -248,9 +254,9 @@ class WeightPlacement:
     def _pin_for(self, name):
         """The first GEMMA4_L1_PIN entry matching this weight name, or None."""
         m = _LAYER_RE.search(name or "")
-        for sub, layers, pcn, per_core in self.pins:
+        for sub, layers, pcn, per_core, origin in self.pins:
             if sub in name and (not layers or (m is not None and int(m.group(1)) in layers)):
-                return sub, layers, pcn, per_core
+                return sub, layers, pcn, per_core, origin
         return None
 
     def per_core_n(self, name):
@@ -260,6 +266,10 @@ class WeightPlacement:
     def per_core(self, name):
         """Whether a pinned weight is allocated per core (GEMMA4_L1_PIN ``:pc``)."""
         return name in self._per_core
+
+    def origin_row(self, name):
+        """First grid row of a pinned weight's shard prefix (GEMMA4_L1_PIN ``:y<n>``), 0 by default."""
+        return self._origin.get(name, 0)
 
     def _layer_allowed(self, name):
         if not self.layers:
@@ -309,6 +319,8 @@ class WeightPlacement:
                 self._pcn[name] = pin[2]
             if pin[3]:
                 self._per_core.add(name)
+            if pin[4]:
+                self._origin[name] = pin[4]
         elif self.only and not any(s in name for s in self.only):
             self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_ONLY"))
             return ttnn.DRAM_MEMORY_CONFIG
@@ -383,18 +395,19 @@ def resolve(placement):
     return placement if placement is not None else DRAM_ONLY
 
 
-def prefix_core_range_set(num_cores, width):
-    """The first ``num_cores`` cores, row-major, of a grid ``width`` cores wide, from (0, 0).
+def prefix_core_range_set(num_cores, width, origin_row=0):
+    """The first ``num_cores`` cores, row-major, of a grid ``width`` cores wide, from (0, ``origin_row``).
 
     This is the core order the 1D mcast factory walks (``num_cores_with_work`` row-major
     over its grid), so a weight sharded here lines up with that factory's cores.
     """
     rows, rem = divmod(num_cores, width)
+    y0 = origin_row
     ranges = []
     if rows:
-        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(width - 1, rows - 1)))
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, y0), ttnn.CoreCoord(width - 1, y0 + rows - 1)))
     if rem:
-        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, rows), ttnn.CoreCoord(rem - 1, rows)))
+        ranges.append(ttnn.CoreRange(ttnn.CoreCoord(0, y0 + rows), ttnn.CoreCoord(rem - 1, y0 + rows)))
     return ttnn.CoreRangeSet(set(ranges))
 
 
@@ -407,7 +420,7 @@ def l1_core_addresses(tensor):
     return {(c.x, c.y): addr for c in cores}
 
 
-def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False):
+def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False, origin_row=0):
     """Reshard a loaded weight to L1 WIDTH_SHARDED on the matmul's compute grid.
 
     Each core ends up holding exactly the N-slice it multiplies, which is what
@@ -423,7 +436,8 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False):
 
     ``per_core`` (with ``per_core_n``; HYBRID allocator mode only, gemma4-12b record §9.4) allocates the shard per
     core. Stock ops bind a sharded buffer at one address, so the shard must land at the same address on all its
-    cores; that is asserted.
+    cores; that is asserted. ``origin_row`` (with ``per_core_n``) starts the prefix at that grid row; the tuner then
+    runs the matmul on that offset rectangle (``allowed_worker_cores``).
     """
     from models.demos.gemma4.tt.matmul_tuning import derive_decode_1d_config
 
@@ -445,9 +459,9 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False):
             return None
         grid_size = mesh_device.compute_with_storage_grid_size()
         cores = -(-(n // T) // per_core_n)
-        if cores > grid_size.x * grid_size.y:
+        if cores > grid_size.x * (grid_size.y - origin_row):
             return None
-        grid = prefix_core_range_set(cores, grid_size.x)
+        grid = prefix_core_range_set(cores, grid_size.x, origin_row)
         mc = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.WIDTH_SHARDED,
             ttnn.BufferType.L1,
@@ -465,8 +479,10 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False):
             logger.info(f"[placement] per-core pin {list(local)} at {addrs.pop()} on {cores} cores")
         return moved
 
-    if per_core:
-        raise ValueError("a per-core pin needs an explicit per_core_N (GEMMA4_L1_PIN <name>:<per_core_N>:pc)")
+    if per_core or origin_row:
+        raise ValueError(
+            "a per-core or offset pin needs an explicit per_core_N (GEMMA4_L1_PIN <name>:<per_core_N>:...)"
+        )
     pc = derive_decode_1d_config(1, k, n)
     if pc is None:
         return None
@@ -580,7 +596,11 @@ def _place_as_tensor(
             return tensor
         try:
             moved = shard_l1_width(
-                tensor, device, per_core_n=placement.per_core_n(name), per_core=placement.per_core(name)
+                tensor,
+                device,
+                per_core_n=placement.per_core_n(name),
+                per_core=placement.per_core(name),
+                origin_row=placement.origin_row(name),
             )
             if moved is None:
                 # Normal for norms / non-matmul weights: give the budget back and

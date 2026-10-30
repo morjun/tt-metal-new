@@ -308,17 +308,29 @@ class DecodeMatmulTuner:
 
     @staticmethod
     def _weight_shard_grid(w):
-        """(cores, shard width in tiles, grid x, grid y) of an L1 WIDTH_SHARDED weight on a row-major
-        prefix from (0, 0), else None."""
+        """(cores, shard width in tiles, grid x, grid y, origin row) of an L1 WIDTH_SHARDED weight on a row-major
+        prefix starting at (0, origin row), else None.
+
+        The 1D-mcast factory walks its cores row-major from the rectangle's top-left corner and binds in1 by address
+        alone, so a shard grid that is not exactly that prefix would be read silently wrong: it raises instead."""
         if not DecodeMatmulTuner._l1_width_sharded(w):
             return None
         spec = w.memory_config().shard_spec
         ranges = list(spec.grid.ranges())
-        if any(r.start.x != 0 for r in ranges) or min(r.start.y for r in ranges) != 0:
+        if any(r.start.x != 0 for r in ranges):
             return None
+        y0 = min(r.start.y for r in ranges)
         gx = max(r.end.x for r in ranges) + 1
-        gy = max(r.end.y for r in ranges) + 1
-        return spec.grid.num_cores(), int(spec.shape[1]) // ttnn.TILE_SIZE, gx, gy
+        gy = max(r.end.y for r in ranges) - y0 + 1
+        cores = spec.grid.num_cores()
+        walked = {(i % gx, y0 + i // gx) for i in range(cores)}
+        have = {(c.x, c.y) for c in ttnn.corerange_to_cores(spec.grid)}
+        if walked != have:
+            raise ValueError(
+                f"weight shard grid {spec.grid} is not the row-major prefix of {cores} cores from (0, {y0}) that the "
+                "1D-mcast matmul walks"
+            )
+        return cores, int(spec.shape[1]) // ttnn.TILE_SIZE, gx, gy, y0
 
     def config_for(self, x, w):
         if not self.enabled:
@@ -336,11 +348,17 @@ class DecodeMatmulTuner:
                 in0_shard_tiles=shard_tiles,
             )
             if pc is not None and w_grid is not None:
-                cores, pcn, gx, gy = w_grid
+                cores, pcn, gx, gy, y0 = w_grid
                 tuned = pc.compute_with_storage_grid_size
-                if (pcn, cores) != (pc.per_core_N, tuned.x * tuned.y):
+                if (pcn, cores) != (pc.per_core_N, tuned.x * tuned.y) or y0:
                     # Weight pinned on its own grid (GEMMA4_L1_PIN per_core_N, gemma4-12b record §9.2): run on
-                    # the shard's cores. Same in0_block_w, so the K accumulation order is unchanged.
+                    # the shard's cores. Same in0_block_w, so the K accumulation order is unchanged. A grid starting
+                    # at row y0 > 0 (record §9.4) runs on that offset rectangle; its output must be interleaved.
+                    offset = (
+                        ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, y0), ttnn.CoreCoord(gx - 1, y0 + gy - 1))])
+                        if y0
+                        else None
+                    )
                     pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                         compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
                         in0_block_w=pc.in0_block_w,
@@ -351,6 +369,7 @@ class DecodeMatmulTuner:
                         fuse_batch=True,
                         fused_activation=None,
                         mcast_in0=True,
+                        allowed_worker_cores=offset,
                     )
             elif pc is not None and (pcn := _grid_override((int(x.shape[-1]), int(w.shape[-1])))) is not None:
                 full = w.device().compute_with_storage_grid_size()
