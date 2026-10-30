@@ -80,22 +80,24 @@ def arm_spec(arm):
     with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2). "+blkfatk<cap>" / "+blkwide<cap>" cap
     in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). A pin suffix ending in "c" allocates that pin
     per core (GEMMA4_L1_PIN ":pc", needs "+hybrid"); "+resB<tiles>" reserves <tiles> head tiles per core, per-core,
-    on the cores outside the 86-core prefix (GEMMA4_LMHEAD_L1_RESERVE_B, record §9.4 S2); "+sliceB<tiles>" builds a real
-    head slice B there (GEMMA4_LMHEAD_L1_SLICE_B); a pin suffix "y<row>" starts that pin's prefix at grid row <row>. "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
+    on the cores outside the 86-core prefix (GEMMA4_LMHEAD_L1_RESERVE_B, record §9.4 S2); "+sliceB<tiles>[top<rows>]" builds a real
+    head slice B there, or on grid rows 0 .. rows - 1 (GEMMA4_LMHEAD_L1_SLICE_B); a pin suffix "y<row>" starts that pin's prefix at grid row <row>. "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
     NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in). A trailing "+hybrid" opens the device in
     the HYBRID allocator mode (TT_METAL_ALLOCATOR_MODE_HYBRID, record §9.4); it is stripped before every other suffix.
     """
     if arm.endswith("+hybrid"):
         base, extra, width = arm_spec(arm[: -len("+hybrid")])
         return base, {**extra, "TT_METAL_ALLOCATOR_MODE_HYBRID": "1"}, width
-    m = re.search(r"\+sliceB(\d+)$", arm)
+    m = re.search(r"\+sliceB(\d+)(?:top(\d+))?$", arm)
     if m:
         # a real head slice B: <tiles> tiles/core per-core on the cores outside the 86-core pin prefix, as stock
-        # matmuls on the complement's rectangles (record §9.4); its columns come out of the DRAM tail
+        # matmuls on the complement's rectangles, or ("top<rows>") on grid rows 0 .. rows - 1 (record §9.4); its
+        # columns come out of the DRAM tail
         base, extra, width = arm_spec(arm[: m.start()])
-        moved = int(m.group(1)) * 32 * (110 - 86)
+        tiles, top = int(m.group(1)), m.group(2)
+        moved = tiles * 32 * (11 * int(top) if top else 110 - 86)
         width = {(str(int(c) - moved), p, o) for c, p, o in width}
-        return base, {**extra, "GEMMA4_LMHEAD_L1_SLICE_B": f"{m.group(1)}:86"}, width
+        return base, {**extra, "GEMMA4_LMHEAD_L1_SLICE_B": f"{tiles}:top{top}" if top else f"{tiles}:86"}, width
     m = re.search(r"\+resB(\d+)$", arm)
     if m:
         # per-core reservation of <tiles> head tiles on the cores outside the 86-core pin prefix (record §9.4 S2)

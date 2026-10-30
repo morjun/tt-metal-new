@@ -67,7 +67,7 @@ def _lm_head_logits_memory_config():
     return ttnn.L1_MEMORY_CONFIG
 
 
-def build_head_slice_b(lm_head, start, tiles, prefix, grid, in0_block_w):
+def build_head_slice_b(lm_head, start, tiles, prefix, grid, in0_block_w, top_rows=0):
     """RESEARCH (gemma4-12b record §9.4; HYBRID allocator mode only): head slice B.
 
     Pins lm_head columns [start, end) per core on the cores outside the row-major prefix of ``prefix`` cores of the
@@ -77,18 +77,23 @@ def build_head_slice_b(lm_head, start, tiles, prefix, grid, in0_block_w):
     Each uses ``in0_block_w`` and the main slice's compute config, so every output column is summed exactly as in the
     unsplit head. Every slice must land at one address on all its cores (stock ops bind it by one address).
 
-    Returns (((weight, program config), ...), end).
+    ``top_rows`` > 0 instead pins them on the one rectangle of grid rows 0 .. top_rows - 1 (layout R4, where the pins
+    sit on the rows below). Returns ([[weight, program config], ...], end): lists, so lm_head_reload can find a slice
+    that a bracketed op overlaps and re-point it after re-creating it.
     """
     from models.demos.gemma4.tt.weight_placement import l1_core_addresses
 
     T = 32
     k = int(lm_head.shape[-2])
-    q, r = divmod(prefix, grid.x)
     rects = []
-    if r:
-        rects.append(ttnn.CoreRange(ttnn.CoreCoord(r, q), ttnn.CoreCoord(grid.x - 1, q)))
-    if q + 1 < grid.y:
-        rects.append(ttnn.CoreRange(ttnn.CoreCoord(0, q + 1), ttnn.CoreCoord(grid.x - 1, grid.y - 1)))
+    if top_rows:
+        rects.append(ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, top_rows - 1)))
+    else:
+        q, r = divmod(prefix, grid.x)
+        if r:
+            rects.append(ttnn.CoreRange(ttnn.CoreCoord(r, q), ttnn.CoreCoord(grid.x - 1, q)))
+        if q + 1 < grid.y:
+            rects.append(ttnn.CoreRange(ttnn.CoreCoord(0, q + 1), ttnn.CoreCoord(grid.x - 1, grid.y - 1)))
     slices, lo = [], start
     for rc in rects:
         gw, gh = rc.grid_size().x, rc.grid_size().y
@@ -119,13 +124,13 @@ def build_head_slice_b(lm_head, start, tiles, prefix, grid, in0_block_w):
             mcast_in0=True,
             allowed_worker_cores=ttnn.CoreRangeSet([rc]),
         )
-        slices.append((w, pc))
+        slices.append([w, pc])
         logger.info(
             f"[lm_head-split] slice B: cols [{lo}, {hi}) per-core on {rc} ({gw * gh} cores, {tiles} tiles/core) "
             f"at {addrs.pop()}"
         )
         lo = hi
-    return tuple(slices), lo
+    return slices, lo
 
 
 class SplitLogits(NamedTuple):
@@ -314,7 +319,7 @@ class Gemma4AssistantModel:
         self.lm_head = None
         self.lm_head_l1 = None
         self.lm_head_l1_pc = None
-        self.lm_head_l1_b = ()  # research (record §9.4): (weight, program config) per slice-B rectangle
+        self.lm_head_l1_b = []  # research (record §9.4): [weight, program config] per slice-B rectangle
         self.lm_head_l1_ckc = None
         self.lm_head_l1_ring = None  # (in0 spec, out spec) when the slice runs as a gather_in0 ring
         if self.use_cme:
@@ -456,13 +461,17 @@ class Gemma4AssistantModel:
             f"charge={charge} B/bank ({charge/1024:.0f} KiB)"
         )
         head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])
-        b_slices, end = (), cols
+        b_slices, end = [], cols
         slice_b = os.getenv("GEMMA4_LMHEAD_L1_SLICE_B", "")
         if slice_b:
-            # RESEARCH (gemma4-12b record §9.4; HYBRID allocator mode only): "<tiles>:<prefix cores>"; see
-            # build_head_slice_b. Allocated before the main slice: per-core buffers go first, at the top of their cores.
-            b_tiles, prefix = (int(v) for v in slice_b.split(":"))
-            b_slices, end = build_head_slice_b(self.lm_head, cols, b_tiles, prefix, grid, blk)
+            # RESEARCH (gemma4-12b record §9.4; HYBRID allocator mode only): "<tiles>:<prefix cores>" (the complement
+            # of the pin prefix) or "<tiles>:top<rows>" (grid rows 0 .. rows - 1); see build_head_slice_b. Allocated
+            # before the main slice: per-core buffers go first, at the top of their cores.
+            b_tiles, where = slice_b.split(":")
+            top = int(where[3:]) if where.startswith("top") else 0
+            b_slices, end = build_head_slice_b(
+                self.lm_head, cols, int(b_tiles), 0 if top else int(where), grid, blk, top_rows=top
+            )
         self.lm_head_l1_b = b_slices
         tail = ttnn.slice(self.lm_head, [0, 0, 0, end], [1, 1, k, vocab])
         self.lm_head.deallocate(True)
