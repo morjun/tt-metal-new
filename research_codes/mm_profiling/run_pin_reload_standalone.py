@@ -79,7 +79,12 @@ def arm_spec(arm):
     suffix runs the fat-K matmuls (o_proj, down_proj; the ring guard refuses pre_projection) as the gather_in0 ring
     with their weights left in DRAM (GEMMA4_GATHER_DRAM_WEIGHT, record §9.2). "+blkfatk<cap>" / "+blkwide<cap>" cap
     in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
-    NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in)."""
+    NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in). A trailing "+hybrid" opens the device in
+    the HYBRID allocator mode (TT_METAL_ALLOCATOR_MODE_HYBRID, record §9.4); it is stripped before every other suffix.
+    """
+    if arm.endswith("+hybrid"):
+        base, extra, width = arm_spec(arm[: -len("+hybrid")])
+        return base, {**extra, "TT_METAL_ALLOCATOR_MODE_HYBRID": "1"}, width
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
