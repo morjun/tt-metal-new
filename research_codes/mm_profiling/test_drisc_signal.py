@@ -171,4 +171,5 @@ def test_drisc_signal_ep_noc1(mesh_device):
         logger.error("[sig1] not every DRISC quit; not waiting")
     assert all(r == [1] for r in results[1]), f"cmd 1 not counted once everywhere: {results[1]}"
     assert all(r == [1, 2] for r in results[2]), f"cmd 2 not counted once everywhere: {results[2]}"
-    assert results["wait1"] < 0.5 and results["wait2"] < 0.5, "wait op ran into its timeout"
+    # wait1 includes the wait kernel's first compile (551 ms on 2026-10-30); wait2 runs the cached program
+    assert results["wait2"] < 0.05, "wait op ran into its timeout"
