@@ -14,7 +14,10 @@
 // incomplete, which the bit-exact checks downstream catch.
 //
 // Compile-time args: num_driscs, go_stream, sync_addr (DRISC L1), timeout_iters.
-// Runtime args: num_driscs words (noc_x << 16 | noc_y). CB 0: 32 * num_driscs B of scratch.
+// A DRISC with bit 31 of its word set writes on NoC1 (its NIU1 is in stream mode) and is polled over NOC1:
+// its NIU0 is in NOC2AXI mode, where a read of a local address returns GDDR, not its L1.
+//
+// Runtime args: num_driscs words (noc1 << 31 | noc_x << 16 | noc_y). CB 0: 32 * num_driscs B of scratch.
 
 #include <cstdint>
 
@@ -31,12 +34,16 @@ void kernel_main() {
     const uint32_t sync_buf = go_buf + 16 * num_driscs;  // 16 B per DRISC
     volatile tt_l1_ptr uint32_t* go = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(go_buf);
     volatile tt_l1_ptr uint32_t* sync = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sync_buf);
+    noc_local_state_init(1 - noc_index);  // the kernel's own NoC is initialised by the firmware; the other is not
     for (uint32_t iters = 0; iters < timeout_iters; ++iters) {
         for (uint32_t d = 0; d < num_driscs; ++d) {
             const uint32_t xy = get_arg_val<uint32_t>(d);
-            noc_async_read(get_noc_addr(xy >> 16, xy & 0xFFFF, go_reg), go_buf + 16 * d, sizeof(uint32_t));
+            const uint8_t noc = xy >> 31 ? 1 : 0;
+            noc_async_read(
+                get_noc_addr((xy >> 16) & 0x7FFF, xy & 0xFFFF, go_reg, noc), go_buf + 16 * d, sizeof(uint32_t), noc);
         }
-        noc_async_read_barrier();
+        noc_async_read_barrier(0);
+        noc_async_read_barrier(1);
         bool taken = true;
         for (uint32_t d = 0; d < num_driscs; ++d) {
             taken = taken && (go[4 * d] & ((1 << REMOTE_DEST_WORDS_FREE_WIDTH) - 1)) == 0;
@@ -46,9 +53,15 @@ void kernel_main() {
         }
         for (uint32_t d = 0; d < num_driscs; ++d) {
             const uint32_t xy = get_arg_val<uint32_t>(d);
-            noc_async_read(get_noc_addr(xy >> 16, xy & 0xFFFF, sync_addr), sync_buf + 16 * d, 2 * sizeof(uint32_t));
+            const uint8_t noc = xy >> 31 ? 1 : 0;
+            noc_async_read(
+                get_noc_addr((xy >> 16) & 0x7FFF, xy & 0xFFFF, sync_addr, noc),
+                sync_buf + 16 * d,
+                2 * sizeof(uint32_t),
+                noc);
         }
-        noc_async_read_barrier();
+        noc_async_read_barrier(0);
+        noc_async_read_barrier(1);
         bool done = true;
         for (uint32_t d = 0; d < num_driscs; ++d) {
             done = done && sync[4 * d] == sync[4 * d + 1];

@@ -30,6 +30,11 @@ closes (`ttnn.close_mesh_device` is wrapped). GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS
 (default 0 = unpaced), so it spreads over the window instead of crowding the first ops after the trigger;
 GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK sets the DRISC DMA chunk in 2 KB pages (default 16).
 
+With TT_MM1D_IN1_BANK0_XY (bank 0 read through another of its endpoints), the DRISC on that endpoint must
+keep its NIU0 in NOC2AXI mode, or those reads return its L1. GEMMA4_LMHEAD_L1_RELOAD_DRISC_EP0 picks how:
+"noc1" (default) runs that DRISC's kernel on NoC1, so only its NIU1 goes to stream mode; "drop" leaves it out
+and the bank's other DRISC pushes all of its pages (exact, but the push no longer hides; record §9.2e).
+
 GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024, the captured global-SDPA ceiling) bounds the snapshot
 and the reload: everything from S up to it is reloaded. Every bracket asserts that its op's highest
 CB end, read from the op's program, does not exceed it.
@@ -51,6 +56,7 @@ CMD_SMALL, CMD_ALL, CMD_QUIT = 1, 2, 3
 # Paced push (off by default): aggregate rate cap over all DRISCs, GB/s (0 = unpaced), and DMA chunk in pages.
 DRISC_GBPS = float(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS", "0"))
 DRISC_CHUNK = int(os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK", "16"))
+DRISC_EP0 = os.getenv("GEMMA4_LMHEAD_L1_RELOAD_DRISC_EP0", "noc1")  # "noc1" or "drop"; see the module docstring
 AICLK_HZ = 1.35e9  # DRISC wall-clock ticks per second (the device profiler converts its timestamps at AICLK)
 WAIT_TIMEOUT = 1_000_000  # waiter polls (two NoC round trips each) before it gives up instead of hanging the device
 PAGE = 2048
@@ -183,16 +189,20 @@ def _drisc_start(st, head):
     ex = ttnn._ttnn.operations.experimental
     dev = st.device
     senders = ex.drisc_senders(dev)
-    # Stream mode (drisc_reload_resident.cpp) makes a DRISC's NIU0 serve DRISC L1 instead of GDDR, so a matmul
-    # reading bank 0 through that endpoint (TT_MM1D_IN1_BANK0_XY, packed x | y << 6) would get the wrong bytes:
-    # leave that DRISC out; the bank's other sender pushes all of its pages.
+    # Stream mode (drisc_reload_resident.cpp) makes a DRISC's NIU serve DRISC L1 instead of GDDR, so a matmul
+    # reading bank 0 through that endpoint on NoC0 (TT_MM1D_IN1_BANK0_XY, packed x | y << 6) would get the wrong
+    # bytes from a DRISC in stream mode on NIU0. "noc1": that DRISC writes on NoC1 instead (stream mode on NIU1
+    # only). "drop": leave it out; the bank's other sender pushes all of its pages.
     ep = int(os.getenv("TT_MM1D_IN1_BANK0_XY", "0"))
-    if ep:
-        kept = [s for s in senders if (s[2].x, s[2].y) != (ep & 0x3F, ep >> 6)]
-        logger.info(
-            f"[lm-head-reload] TT_MM1D_IN1_BANK0_XY=({ep & 0x3F}, {ep >> 6}): {len(senders) - len(kept)} DRISC left out"
-        )
+    ep_xy = (ep & 0x3F, ep >> 6) if ep else None
+    if ep_xy and DRISC_EP0 == "drop":
+        kept = [s for s in senders if (s[2].x, s[2].y) != ep_xy]
+        logger.info(f"[lm-head-reload] TT_MM1D_IN1_BANK0_XY={ep_xy}: {len(senders) - len(kept)} DRISC left out")
         senders = kept
+    elif ep_xy:
+        n = sum((s[2].x, s[2].y) == ep_xy for s in senders)
+        logger.info(f"[lm-head-reload] TT_MM1D_IN1_BANK0_XY={ep_xy}: {n} DRISC writes on NoC1")
+    noc1 = {(s[1].x, s[1].y) for s in senders if ep_xy and DRISC_EP0 != "drop" and (s[2].x, s[2].y) == ep_xy}
     base, size = ex.drisc_l1_unreserved(dev)
     chunk = min(DRISC_CHUNK, size // (2 * PAGE))
     banks = sorted({b for b, _, _ in senders})
@@ -211,11 +221,13 @@ def _drisc_start(st, head):
                 [c for k, c in enumerate(core_set) if k % len(by_bank[b]) == e] for core_set in (st.small, st.cores)
             ]
             rt = [st.snap.buffer_address(), len(banks), b, st.pages, st.S, base, len(lists[0]), len(lists[1])]
+            rt.append(1 if (logical.x, logical.y) in noc1 else 0)  # the NoC this DRISC writes on
             for lst in lists:
                 for c in lst:
                     rt += [st.index[c], xy(c)]
             rts[(logical.x, logical.y)] = rt
-    st.drisc_xy = [(v.x << 16) | v.y for _, _, v in senders]
+    # bit 31: the trigger and wait ops reach this DRISC over NoC1 (its NIU0 stays in NOC2AXI mode)
+    st.drisc_xy = [((l.x, l.y) in noc1) << 31 | (v.x << 16) | v.y for _, l, v in senders]
     cores = [ttnn.CoreCoord(*k) for k in rts]
     st.drisc_cores, st.drisc_sync_addr = cores, base + 2 * chunk * PAGE  # (taken, done) after the DMA buffers
     # Paced: each DRISC issues one page per `pace` ticks, so the 16 together stay under DRISC_GBPS.

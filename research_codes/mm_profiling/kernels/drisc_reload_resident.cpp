@@ -24,8 +24,10 @@
 //   go_stream, pace (wall-clock ticks per page; 0 = unpaced). Paced, the n-th page of a push is not
 //   issued before start + n * pace, which caps this DRISC at page_bytes per pace ticks.
 // sync[2] holds the wall-clock ticks the last push took (debugging).
-// Runtime args: snap_base, num_banks, bank, pages, dst_l1 (S), drisc_l1_buf, n_small, n_all,
-//   then n_small (core_index, noc_x << 16 | noc_y) pairs, then n_all pairs.
+// Runtime args: snap_base, num_banks, bank, pages, dst_l1 (S), drisc_l1_buf, n_small, n_all, noc,
+//   then n_small (core_index, noc_x << 16 | noc_y) pairs, then n_all pairs. `noc` is the NoC this DRISC
+//   writes on, and the NIU it switches to stream mode: 0, or 1 on the sender whose NoC0 endpoint a Tensix
+//   reader uses (TT_MM1D_IN1_BANK0_XY), so that its NIU0 keeps serving GDDR.
 // With DIAG_SIGNAL defined the kernel only records the go counts it reads (sync[2..9], no push) and quits on
 // a count >= 3 (test_drisc_signal.py).
 
@@ -70,8 +72,8 @@ inline void bank_run(const Job& j, uint32_t c, uint32_t& first, uint32_t& count)
     count = first < j.pages ? (j.pages - first + j.num_banks - 1) / j.num_banks : 0;
 }
 
-void reload(const Job& j, uint32_t n_cores, uint32_t arg0, uint32_t buf0) {
-    Noc noc;
+void reload(const Job& j, uint32_t n_cores, uint32_t arg0, uint32_t buf0, uint8_t noc_id) {
+    Noc noc(noc_id);
     UnicastEndpoint src;
     UnicastEndpoint dst;
     const uint32_t bufs[2] = {buf0, buf0 + chunk_pages * page_bytes};
@@ -150,12 +152,15 @@ void kernel_main() {
     const uint32_t buf0 = get_arg_val<uint32_t>(5);
     const uint32_t n_small = get_arg_val<uint32_t>(6);
     const uint32_t n_all = get_arg_val<uint32_t>(7);
+    const uint8_t noc_id = get_arg_val<uint32_t>(8);
     // sync[0] = commands taken, sync[1] = commands done (read by drisc_reload_wait.cpp).
     volatile uint32_t* sync = reinterpret_cast<volatile uint32_t*>(buf0 + 2 * chunk_pages * page_bytes);
 
-    // Stream mode on this kernel's NIU (NOC0) lets the DRISC initiate NoC writes. Tensix DRAM traffic
-    // reaches these endpoints on NOC1 only, so it keeps its NOC2AXI path (as for the tensor prefetcher).
-    experimental::drisc_set_stream_mode();
+    // Stream mode on the NIU this kernel writes through lets the DRISC initiate NoC writes; the other NIU keeps
+    // its NOC2AXI path to GDDR. NoC0 by default: Tensix DRAM traffic reaches these endpoints on NOC1 only.
+    // NoC1 on a sender whose NoC0 endpoint serves Tensix reads (TT_MM1D_IN1_BANK0_XY).
+    experimental::drisc_set_stream_mode(noc_id);
+    noc_local_state_init(noc_id);  // drisck.cc initialises only NOC_INDEX's counters
     NOC_STREAM_WRITE_REG(go_stream, STREAM_REMOTE_DEST_BUF_SIZE_REG_INDEX, 0);  // zero the go counter
     for (uint32_t k = 0; k < 10; ++k) {
         sync[k] = 0;
@@ -183,13 +188,13 @@ void kernel_main() {
         }
         const uint32_t t = get_timestamp_32b();
         if (cmd == CMD_SMALL) {
-            reload(j, n_small, 8, buf0);
+            reload(j, n_small, 9, buf0, noc_id);
         } else {
-            reload(j, n_all, 8 + 2 * n_small, buf0);
+            reload(j, n_all, 9 + 2 * n_small, buf0, noc_id);
         }
         sync[2] = get_timestamp_32b() - t;
         sync[1] = sync[1] + 1;  // done: reload() returned after every write was acked
     }
 
-    experimental::drisc_set_noc2axi_mode();  // as every DRISC kernel: leave the firmware default
+    experimental::drisc_set_noc2axi_mode(noc_id);  // as every DRISC kernel: leave the firmware default
 }
