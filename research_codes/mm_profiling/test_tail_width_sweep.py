@@ -21,13 +21,14 @@ odd rounds. Writes TW_OUT/<arm>.json.
 import json
 import os
 import statistics
+import time
 from pathlib import Path
 
 from loguru import logger
 
 import ttnn
 from models.demos.gemma4.tests.test_factory import parametrize_mesh_with_fabric
-from research_codes.mm_profiling.test_lmhead_out_block_w import GRID, _ckc, _pc, _timed
+from research_codes.mm_profiling.test_lmhead_out_block_w import GRID, INNER, REPLAYS, _ckc, _pc
 
 ROUNDS = int(os.getenv("TW_ROUNDS", "3"))
 OUT = Path(os.getenv("TW_OUT", "generated/lmhead_l1_profile/tail_width_sweep"))
@@ -35,10 +36,37 @@ ARM = os.getenv("TW_ARM", "prod")
 K = 1024
 
 
+def _timed(device, fn):
+    """Per-call us: INNER calls in one trace, replayed REPLAYS times. Each call's L1 logits are freed right after it,
+    as in the drafter (INNER live L1 outputs would overflow L1 into the matmul's circular buffers)."""
+
+    def calls():
+        for _ in range(INNER):
+            fn().deallocate(True)
+
+    calls()
+    ttnn.synchronize_device(device)
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    calls()
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+    for _ in range(3):
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(device)
+    t0 = time.perf_counter()
+    for _ in range(REPLAYS):
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=False)
+    ttnn.synchronize_device(device)
+    us = (time.perf_counter() - t0) / REPLAYS / INNER * 1e6
+    ttnn.release_trace(device, tid)
+    return us
+
+
 def configs():
     out = [(6322, 66, 6), (6652, 66, 6), (6580, 75, 5), (6652, 75, 5), (7354, 75, 5), (8192, 75, 5)]
     out += [(66 * c, 66, 6) for c in range(80, 111, 2)]
     out += [(75 * c, 75, 5) for c in range(80, 110, 3)]
+    if os.getenv("TW_ONLY"):  # "<tiles>:<pcN>:<ow>,..." to run a subset
+        out = [tuple(int(v) for v in c.split(":")) for c in os.environ["TW_ONLY"].split(",")]
     return list(dict.fromkeys(out))
 
 
@@ -52,6 +80,8 @@ def test_tail_width_sweep(mesh_device, reset_seeds):
         for tiles, pcn, obw in cfgs if r % 2 == 0 else cfgs[::-1]:
             w = ttnn.rand([1, 1, K, tiles * 32], device=mesh_device, dtype=ttnn.bfloat16, low=-0.05, high=0.05, seed=2)
             pc = _pc(pcn, obw)
+            if os.getenv("TW_IW"):  # in0_block_w override (timing only; iw is a class-A knob for numerics)
+                pc.in0_block_w = int(os.environ["TW_IW"])
 
             def fn():
                 return ttnn.linear(
