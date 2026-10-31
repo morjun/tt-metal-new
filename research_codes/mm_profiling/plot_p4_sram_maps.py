@@ -16,7 +16,7 @@ The hatched outline marks [S, reload end) on the global SDPA's 32 cores: overwri
 and copied back from DRAM by the reload. Program CBs and small L1 activations (logits) come and go per op and are
 not drawn. Per core: weight bytes / allocatable bytes (above the fixed reservation).
 
-    python research_codes/mm_profiling/plot_p4_sram_maps.py <out dir> [<figure path stem>]
+    python research_codes/mm_profiling/plot_p4_sram_maps.py <out dir> [<figure path stem> [<arm ids, e.g. a,b,c,d,e>]]
 """
 
 import json
@@ -48,21 +48,29 @@ RESERVED = "#999999"
 
 # (id, label, log): the attribution arms a-e (standalone_p4_attr) and the S5 layouts (standalone_p4_s5)
 ARMS = [
-    ("a", "a. F0: head 17 tiles", "standalone_p4_attr/00_R59840_66_6_rope_drisc60c2+logitsl1+gridwide+vc1+ep0.log"),
-    ("b", "b. head 14 tiles", "standalone_p4_attr/01_R49280_66_6_rope_drisc60c2+logitsl1+gridwide+vc1+ep0.log"),
+    (
+        "a",
+        "a. F0: 17 head tiles per core",
+        "standalone_p4_attr/00_R59840_66_6_rope_drisc60c2+logitsl1+gridwide+vc1+ep0.log",
+    ),
+    (
+        "b",
+        "b. 14 head tiles per core (tail 66 / ow6)",
+        "standalone_p4_attr/01_R49280_66_6_rope_drisc60c2+logitsl1+gridwide+vc1+ep0.log",
+    ),
     (
         "c",
-        "c. head 14 tiles, other tail",
+        "c. 14 head tiles per core (tail 75 / ow5)",
         "standalone_p4_attr/02_R49280_75_5_rope_drisc60c2+logitsl1+gridwide+vc1+ep0.log",
     ),
     (
         "d",
-        "d. + up L0 pin, slice-B room empty",
+        "d. c + up L0 on the 86 pin cores",
         "standalone_p4_attr/03_R49280_75_5_rope_drisc60c2+logitsl1+gridwide+vc1+ep0+pinup_proj@0p3c+resB3+hybrid.log",
     ),
     (
         "e",
-        "e. H1: + slice B",
+        "e. H1: d + slice B on the 24 other cores",
         "standalone_p4_attr/04_R49280_75_5_rope_drisc60c2+logitsl1+gridwide+vc1+ep0+pinup_proj@0p3c+sliceB3+hybrid.log",
     ),
     (
@@ -233,7 +241,7 @@ def legend_handles(kinds):
     return h
 
 
-def main(out, stem=None):
+def main(out, stem=None, keys=None):
     out.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": SURFACE, "savefig.facecolor": SURFACE})
     arms, manifest = [], []
@@ -279,17 +287,27 @@ def main(out, stem=None):
         )
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     if stem:
-        fig, axes = plt.subplots(2, 4, figsize=(20, 11.2))
+        shown = [a for a in arms if keys is None or a[0] in keys]
+        cols = (len(shown) + 1) // 2
+        fig, axes = plt.subplots(2, cols, figsize=(5 * cols, 11.2))
         fig.subplots_adjust(left=0.02, right=0.995, top=0.96, bottom=0.11, wspace=0.06, hspace=0.12)
-        for ax, (key, label, bufs, head, reload_end) in zip(axes.flat, arms):
+        for ax in axes.flat[len(shown) :]:
+            ax.axis("off")
+        for ax, (key, label, bufs, head, reload_end) in zip(axes.flat, shown):
             draw(ax, bufs, head, reload_end, labels=False)
             ax.set_title(label, fontsize=11.5, fontweight="bold", color=INK, loc="left")
-        kinds = set(KIND)
-        fig.legend(handles=legend_handles(kinds), loc="lower center", ncol=6, fontsize=9.5, frameon=False)
+        kinds = {b["kind"] for a in shown for b in a[2]}
+        fig.legend(
+            handles=legend_handles(kinds), loc="lower center", ncol=min(6, cols + 1), fontsize=9.5, frameon=False
+        )
         for ext in ("png", "pdf"):
             fig.savefig(f"{stem}.{ext}", dpi=150)
         plt.close(fig)
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), sys.argv[2] if len(sys.argv) > 2 else None)
+    main(
+        Path(sys.argv[1]),
+        sys.argv[2] if len(sys.argv) > 2 else None,
+        sys.argv[3].split(",") if len(sys.argv) > 3 else None,
+    )
