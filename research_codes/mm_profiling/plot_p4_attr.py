@@ -27,10 +27,10 @@ from analyze_p4_attr import cell  # noqa: E402
 ROOT = Path("generated/lmhead_l1_profile")
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 STEPS = [
-    ("a → b\n3 head tiles to DRAM", "01", "00"),
-    ("b → c\ntail config", "02", "01"),
-    ("c → d\n+ up L0 pin", "03", "02"),
-    ("d → e\n+ slice B (= H1)", "04", "03"),
+    ("F0 → b: slice A 17 → 14 tiles\nper core (330 tiles to DRAM)", "01", "00"),
+    ("b → c: other tail config\n(same columns)", "02", "01"),
+    ("c → d: up L0 on the\n86 pin cores", "03", "02"),
+    ("d → e = H1: slice B,\n3 tiles on the 24 other cores", "04", "03"),
 ]
 PARTS = [  # (label, keys, color); hue = part, purple family = head in L1
     ("DRAM tail", ["head DRAM tail"], "#5d6b7e"),
@@ -109,9 +109,9 @@ def main(stem):
     arms = [d.name.split("_", 2)[2] for d in sorted((ROOT / "opprof_p4_attr").iterdir()) if d.is_dir()]
     stand = {f"{i:02d}": statistics.median(med[a]) * 1e3 for i, a in enumerate(arms)}
 
-    fig = plt.figure(figsize=(22, 7.6))
+    fig = plt.figure(figsize=(23, 7.6))
     gs = fig.add_gridspec(
-        1, 3, width_ratios=[1.2, 0.85, 0.85], wspace=0.62, left=0.075, right=0.985, top=0.9, bottom=0.24
+        1, 3, width_ratios=[1.2, 0.85, 0.85], wspace=0.62, left=0.105, right=0.985, top=0.9, bottom=0.24
     )
 
     # left: per-step part changes
@@ -171,13 +171,13 @@ def main(stem):
     per_avg = a["head DRAM tail"] / 3 / f0_tiles  # F0 tail average
     per_marg = tail_add / 3 / 330  # tiles 15-17 x 110 cores
     rows = [
-        ("up L0 pin: kernel saving", up_dram - up_l1, "total", "#e69f00"),
-        ("+ time the pinned matmul still takes", up_l1, "step", "#e69f00"),
-        ("= up L0's DRAM time (256 column tiles)", up_dram, "total", "#e69f00"),
-        ("+ 74 more column tiles (330 vs 256)", (330 - 256) * per_up * 3, "step", "#5d6b7e"),
-        ("+ tail's average tile is cheaper than up L0's", (per_avg - per_up) * 330 * 3, "step", "#5d6b7e"),
-        ("+ marginal tail tiles cost more than average", (per_marg - per_avg) * 330 * 3, "step", "#5d6b7e"),
-        ("= 3 head tiles' DRAM-tail time", tail_add, "total", "#5d6b7e"),
+        ("up L0: direct value (DRAM-fed − L1-fed)", up_dram - up_l1, "total", "#e69f00"),
+        ("+ up L0's L1-fed matmul time", up_l1, "step", "#e69f00"),
+        ("= up L0's DRAM-fed time (256 tiles)", up_dram, "total", "#e69f00"),
+        ("+ 74 more tiles moved (330 vs 256)", (330 - 256) * per_up * 3, "step", "#5d6b7e"),
+        ("+ tail's average per tile is below up L0's", (per_avg - per_up) * 330 * 3, "step", "#5d6b7e"),
+        ("+ step rate near F0 is below the average", (per_marg - per_avg) * 330 * 3, "step", "#5d6b7e"),
+        ("= DRAM-tail time of the 330 head tiles", tail_add, "total", "#5d6b7e"),
     ]
     ax = fig.add_subplot(gs[1])
     style(ax)
@@ -199,7 +199,7 @@ def main(stem):
     ax.set_axisbelow(True)
     ax.set_xlabel("µs per 3-token draft (profiled op time)", color=INK2, fontsize=10)
     ax.set_title(
-        "Why +162 for the head tiles but −80 for the pin", loc="left", fontsize=12.5, fontweight="bold", color=INK
+        "Why the 330 head tiles cost +162 but up L0 saves 80.5", loc="left", fontsize=12.5, fontweight="bold", color=INK
     )
 
     # right: tail time above F0's per-tile rate, vs width
@@ -218,7 +218,7 @@ def main(stem):
     ax.xaxis.grid(True, color=GRID, lw=0.8)
     ax.yaxis.grid(True, color=GRID, lw=0.8)
     ax.set_axisbelow(True)
-    ax.set_xlabel("DRAM-tail width, column tiles (32 columns each)", color=INK2, fontsize=10)
+    ax.set_xlabel("DRAM-tail width, tiles (64 KiB = 32 columns each)", color=INK2, fontsize=10)
     ax.set_ylabel("µs per call above F0's per-tile rate", color=INK2, fontsize=10)
     ax.set_title("The tail's cost per tile rises with width", loc="left", fontsize=12.5, fontweight="bold", color=INK)
     for (t, cfg), label in {

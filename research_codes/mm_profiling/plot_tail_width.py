@@ -83,7 +83,7 @@ def main(stem):
     ax.xaxis.grid(True, color=GRID, lw=0.8)
     ax.yaxis.grid(True, color=GRID, lw=0.8)
     ax.set_axisbelow(True)
-    ax.set_xlabel("DRAM-tail width, column tiles (64 KiB each)", color=INK2, fontsize=10.5)
+    ax.set_xlabel("DRAM-tail width, tiles (64 KiB = 32 columns each)", color=INK2, fontsize=10.5)
     ax.set_ylabel("tail matmul time per call, µs", color=INK2, fontsize=10.5)
     ax.set_title("Tail time against width", loc="left", fontsize=13, fontweight="bold", color=INK)
     ax.legend(
@@ -143,7 +143,7 @@ def main(stem):
     bx.xaxis.grid(True, color=GRID, lw=0.8)
     bx.yaxis.grid(True, color=GRID, lw=0.8)
     bx.set_axisbelow(True)
-    bx.set_xlabel("DRAM-tail width, column tiles (64 KiB each)", color=INK2, fontsize=10.5)
+    bx.set_xlabel("DRAM-tail width, tiles (64 KiB = 32 columns each)", color=INK2, fontsize=10.5)
     bx.set_ylabel("GB/s", color=INK2, fontsize=10.5)
     bx.set_title("Average rate vs the rate of each width step", loc="left", fontsize=13, fontweight="bold", color=INK)
     bx.legend(
