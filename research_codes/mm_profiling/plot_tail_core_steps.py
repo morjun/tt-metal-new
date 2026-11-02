@@ -77,15 +77,28 @@ def main(stem):
     for k, pts in lines.items():
         xs = sorted(pts)
         ax.plot(xs, [pts[c] for c in xs], color=CLASS[k][1], lw=1.8, marker="o", ms=6, mec=SURFACE, mew=0.6, zorder=2)
-    for c, t, name in ((96, 6322, "F0"), (101, 6652, "b")):
+    arms = (
+        (
+            96,
+            6322,
+            "head in L1: 17 tiles per core x 110 cores (59,840 columns)\nDRAM tail: 6,322 tiles on 96 cores",
+            (84, 880),
+        ),
+        (
+            101,
+            6652,
+            "head in L1: 14 tiles per core x 110 cores (49,280 columns)\nDRAM tail: 6,652 tiles on 101 cores",
+            (100.5, 790),
+        ),
+    )
+    for c, t, name, off in arms:
         u = lines[cls(t)][c]
         ax.annotate(
             name,
             (c, u),
-            xytext=(-26, 14),
-            textcoords="offset points",
-            fontsize=11,
-            fontweight="bold",
+            xytext=off,
+            textcoords="data",
+            fontsize=10,
             color=INK,
             arrowprops={"arrowstyle": "-", "color": INK, "lw": 0.8},
         )
