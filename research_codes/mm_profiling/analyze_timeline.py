@@ -141,9 +141,13 @@ def cell_analysis(cell, l1_fed, mask):
         per[i][core][(e, b)] = t / MHZ
         counts[i][(core, risc)] += 1
         inside += 1
-    # clock alignment: markers that fall in no op's firmware window at all
+    # clock alignment: markers inside the profiled replays' time range that fall in no op's firmware window (markers
+    # before the first replay belong to the eager compile run, which ops_perf does not list)
     ostarts = [a[0] for a in allops]
+    lo, hi = allops[0][0], max(a[1] for a in allops)
     for t, *_ in markers:
+        if not lo <= t <= hi:
+            continue
         j = bisect.bisect_right(ostarts, t) - 1
         if j < 0 or t > allops[j][1]:
             outside += 1
@@ -181,8 +185,10 @@ def summarize(calls, key):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("root", type=Path)
+    p.add_argument("--unmarked", type=Path, nargs="*", default=[], help="more roots whose unmarked c / d cells count")
     args = p.parse_args()
-    cells = sorted(d for d in args.root.iterdir() if (d / "ops_perf.csv").exists())
+    cells = sorted(d for r in [args.root, *args.unmarked] for d in r.iterdir() if (d / "ops_perf.csv").exists())
+    cells = [d for d in cells if d.parent == args.root or "+timeline" not in d.name]
     base_dur = defaultdict(list)
     res = []
     for d in cells:

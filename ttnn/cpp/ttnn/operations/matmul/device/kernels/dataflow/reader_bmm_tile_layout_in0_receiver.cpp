@@ -12,6 +12,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/dataflow/noc_semaphore.h"
 #ifdef MM_TIMELINE
+#include "tools/profiler/kernel_profiler.hpp"
 // RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline marker, (event << 8) | block, in marker set `set` (a bit
 // of the MM_TIMELINE mask). Off unless the factory passes MM_TIMELINE (TT_MM1D_TIMELINE).
 template <uint32_t set>
