@@ -2,9 +2,10 @@
 """fig24: attribution of H1 vs F0 (gemma4-12b record §9.4).
 
 Left: per-step change of each part of the drafter (traced time-mode profile, analyze_p4_attr.py), µs per 3-step
-draft, with the standalone step (median of 3 rounds) as a marker. Middle: why the 330 head tiles (3 per core on 110
-cores) save 159.1 µs per draft in L1 but the up L0 pin only 80.5: a bridge with both weights' DRAM reads priced at
-the tail's full-core rate (134.9 ns per tile per call; record §9.2b, "Pin-value reasoning"). Right: the DRAM tail's time per
+draft, with the standalone step (median of 3 rounds) as a marker. Middle: for the 330 head tiles (a vs b) and the up
+L0 pin (c vs d), the DRAM read window the move to L1 removes (NIU samples, tail_slow_niu cells; run
+item6/analyze_niu_instances.py on them first) beside the op time it saves (profiled D); record §9.2b, "Read windows
+and residuals". Right: the DRAM tail's time per
 call above F0's per-tile rate, against its width (every vc1 + ep0 time-mode profile with that tail).
 
     python research_codes/mm_profiling/plot_p4_attr.py <figures dir>
@@ -169,63 +170,71 @@ def main(outdir):
 
     save(fig, "fig24a_h1_step_parts")
 
-    # middle: bridge from up L0's saving to the head columns' saving, both reads priced at the tail's full-core rate
+    # middle: DRAM read window each weight removes (NIU, tail_slow_niu cells of arms a / b / c) against the op time
+    # its move to L1 saves (profiled D); the gap is the residual P (record §9.2b, "Read windows and residuals")
     a, b, c, d = prof["00"], prof["01"], prof["02"], prof["03"]
     up_dram, up_l1 = c["up_proj L0"], d["up_proj L0"]
     tail_add = b["head DRAM tail"] - a["head DRAM tail"]
     f0_tiles = 202304 // 32
     per_avg = a["head DRAM tail"] / 3 / f0_tiles  # F0 tail average, µs per tile per call (right panel)
-    RATE = 0.1349  # µs per tile per call: isolated tail, full-core widths 80-110 cores (record §9.4 stage 1)
-    head_vis = a["head slice A"] - b["head slice A"]  # slice A's per-tile work for the 3 tiles per core
+    head_vis = a["head slice A"] - b["head slice A"]  # slice A's per-tile time for the 3 tiles per core
     head_d = tail_add - head_vis
     up_d = up_dram - up_l1
-    reads_head, reads_up = round(330 * RATE * 3, 1), round(256 * RATE * 3, 1)  # 133.6, 103.6 as in the record
-    extras = tail_add - reads_head
-    up_hidden = reads_up - up_d  # up L0's work that ran during its DRAM reads
-    rows = [
-        ("up L0 in L1 saves (DRAM-fed − L1-fed)", up_d, "total", "#e69f00"),
-        (
-            "+ more weight read from DRAM:\n330 tiles vs 256, at 134.9 ns per tile",
-            reads_head - reads_up,
-            "step",
-            "#5d6b7e",
-        ),
-        (
-            "+ extra tail time where b's width lands\n(core steps above average, width ≡ 4 mod 8)",
-            extras,
-            "step",
-            "#5d6b7e",
-        ),
-        (
-            f"+ op work that L1 makes visible:\nup L0 {up_hidden:.1f} vs head {head_vis:.1f}",
-            up_hidden - head_vis,
-            "step",
-            "#e69f00",
-        ),
-        ("= 330 head tiles in L1 save\n(tail time − slice A per-tile time)", head_d, "total", "#5d6b7e"),
+    niu = {
+        k: json.loads(next((ROOT / "tail_slow_niu").glob(f"{k}_*/niu_instances.json")).read_text())
+        for k in ("00", "01", "02")
+    }  # written by item6/analyze_niu_instances.py
+    win = lambda k, op: 3 * niu[k][op]["window_us"]["mean"]  # noqa: E731  µs per draft
+    r_head = win("01", "lm_head DRAM tail") - win("00", "lm_head DRAM tail")
+    r_up = win("02", "up_proj (sliding) L0")
+    rows = [  # (label, read window removed, op time saved)
+        ("330 head tiles\n(3 per core on 110 cores)", r_head, head_d),
+        ("up_proj layer 0\n(256 tiles, 3 per core on 86 cores)", r_up, up_d),
     ]
-    fig, ax = plt.subplots(figsize=(10, 5.6))
-    fig.subplots_adjust(left=0.38, right=0.96, top=0.89, bottom=0.13)
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    fig.subplots_adjust(left=0.27, right=0.96, top=0.87, bottom=0.2)
     style(ax)
-    run = 0.0
-    for i, (label, v, kind, color) in enumerate(rows):
-        if kind == "total":
-            ax.barh(i, v, color=color, height=0.6, edgecolor=SURFACE)
-            run = v
-            ax.text(v + 3, i, f"{v:.1f}", va="center", fontsize=9.5, color=INK, fontweight="bold")
-        else:
-            left = run if v >= 0 else run + v
-            ax.barh(i, abs(v), left=left, color=color, alpha=0.45, height=0.6, edgecolor=color, linewidth=1)
-            ax.text(max(run, run + v) + 3, i, f"{v:+.1f}", va="center", fontsize=9.5, color=INK)
-            run += v
-    ax.set_yticks(range(len(rows)), [r[0] for r in rows], fontsize=9.5, color=INK)
+    h = 0.34
+    for i, (label, r, dd) in enumerate(rows):
+        ax.barh(i - h / 2, r, height=h, color="#5d6b7e", edgecolor=SURFACE)
+        ax.barh(i + h / 2, dd, height=h, color="#e69f00", edgecolor=SURFACE)
+        ax.text(r + 2, i - h / 2, f"{r:.1f}", va="center", fontsize=10, color=INK)
+        ax.text(dd + 2, i + h / 2, f"{dd:.1f}", va="center", fontsize=10, color=INK, fontweight="bold")
+        ax.text(
+            max(r, dd) + 22,
+            i,
+            f"difference\n{r - dd:.1f}",
+            va="center",
+            fontsize=9.5,
+            color=INK2,
+        )
+    ax.set_yticks(range(len(rows)), [r[0] for r in rows], fontsize=10, color=INK)
     ax.set_ylim(len(rows) - 0.5, -0.6)
-    ax.set_xlim(0, 185)
+    ax.set_xlim(0, 215)
     ax.xaxis.grid(True, color=GRID, lw=0.8)
     ax.set_axisbelow(True)
-    ax.set_xlabel("µs per 3-token draft (profiled op time)", color=INK2, fontsize=10)
+    ax.set_xlabel("µs per 3-token draft", color=INK2, fontsize=10)
+    ax.legend(
+        handles=[
+            plt.Rectangle((0, 0), 1, 1, color="#5d6b7e"),
+            plt.Rectangle((0, 0), 1, 1, color="#e69f00"),
+        ],
+        labels=[
+            "DRAM read time removed (hardware read counters: reader start to last weight byte)",
+            "matmul time saved (time with the weight in DRAM − time with it in SRAM)",
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.4, -0.11),
+        frameon=False,
+        fontsize=9,
+        ncol=1,
+    )
     ax.set_title(
-        "Why 330 head tiles in L1 save 159 but up L0 only 80.5", loc="left", fontsize=12.5, fontweight="bold", color=INK
+        "DRAM read time removed vs matmul time saved",
+        loc="left",
+        fontsize=12.5,
+        fontweight="bold",
+        color=INK,
     )
 
     save(fig, "fig24b_head_vs_pin_saving")
@@ -278,8 +287,8 @@ def main(outdir):
     )
     save(fig, "fig24c_tail_above_rate")
     print(f"up L0 DRAM {up_dram:.1f}, L1 {up_l1:.1f}; tail +{tail_add:.1f}; slice A per-tile {head_vis:.1f}")
-    for label, v, kind, _ in rows:
-        print(f"  {label:50s} {v:7.1f}")
+    for label, r, dd in rows:
+        print(f"  {label.split(chr(10))[0]:16s} read window {r:6.1f}  saved {dd:6.1f}  difference {r - dd:5.1f}")
     for (t, cfg), v in sorted(pts.items()):
         print(
             f"  tail {t} {cfg}: {statistics.median(v):.1f} µs/call (n={len(v)}), above F0 rate {statistics.median(v) - per_avg * t:+.1f}"
