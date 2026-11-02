@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""fig28: time added per added core in the isolated lm_head DRAM tail (gemma4-12b record §9.2b / §9.4).
+"""fig28: lm_head DRAM-tail time against core count (gemma4-12b record §9.2b / §9.4).
 
-Data: test_tail_width_sweep.py on build_codex_current (vc1 + ep0, in0_block_w 2), µs per call, median over rounds.
-  - single-core steps: per core count, the median time over widths not ≡ 0 or 4 mod 8 (66 tiles per core: fine_codex
-    + prod_codex, 96-102 cores; 75 tiles per core: core99_codex, one width per core count, 96-101 cores); step = the
-    difference between consecutive core counts
-  - multi-core steps: the full-core coarse sweep (prod_codex: 66 x 80, 82, ... 110; 75 x 80, 83, ... 107), step =
-    time difference / cores added, drawn over the cores it spans. At 66 tiles per core every coarse width is ≡ 0 or
-    4 mod 8, so each such step also carries the change in the width penalty
-  - the dashed line: the slope of a line fitted to the coarse full-core points x tiles per core (the "average" step)
+Isolated tail matmul at 66 tiles per core (test_tail_width_sweep.py on build_codex_current; vc1 + ep0, in0_block_w 2),
+µs per call. Every measured width (fine_codex + prod_codex; each width = median of its rounds) is grouped by its core
+count ceil(width / 66). Within a core count the time does not depend on how full the last core is (its phantom reads
+fill it), only on whether the width is ≡ 0 or 4 mod 8. One box per core count with ≥ 3 widths; one dot per width,
+coloured by width mod 8; the line joins the per-core-count medians.
 
     python research_codes/mm_profiling/plot_tail_core_steps.py <figure path stem>
 """
@@ -27,116 +24,96 @@ from matplotlib.lines import Line2D  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from plot_p4_attr import GRID, INK, INK2, ROOT, SURFACE, style  # noqa: E402
 
-SW = ROOT / "tail_width_sweep"
-SINGLE, UP, DOWN, MIXED, HI = "#0072b2", "#d55e00", "#e69f00", "#8c8b86", "#cc79a7"
+PCN = 66
+CLASS = {0: ("width ≡ 0 mod 8", "#d55e00"), 4: ("width ≡ 4 mod 8", "#e69f00"), None: ("other widths", "#0072b2")}
 
 
-def rows(name, pcn):
-    return [r for r in json.loads((SW / f"{name}.json").read_text())["rows"] if r["per_core_N"] == pcn]
-
-
-def cores(t, pcn):
-    return -(-t // pcn)
-
-
-def single_steps(names, pcn):
+def load():
     pts = {}
-    for n in names:
-        for r in rows(n, pcn):
-            pts.setdefault(r["tiles"], []).extend(r["us"])
+    for name in ("fine_codex", "prod_codex"):
+        for r in json.loads((ROOT / "tail_width_sweep" / f"{name}.json").read_text())["rows"]:
+            if r["per_core_N"] == PCN:
+                pts.setdefault(r["tiles"], []).extend(r["us"])
     by = {}
     for t, v in pts.items():
-        if t % 4:
-            by.setdefault(cores(t, pcn), []).append(statistics.median(v))
-    med = {c: statistics.median(v) for c, v in by.items()}
-    cs = sorted(c for c in med if c - 1 in med)
-    return {c: med[c] - med[c - 1] for c in cs}
+        by.setdefault(-(-t // PCN), []).append((t, statistics.median(v)))
+    return {c: sorted(v) for c, v in sorted(by.items()) if 80 <= c <= 110}
 
 
-def coarse(pcn):
-    full = sorted((r["tiles"], r["median_us"]) for r in rows("prod_codex", pcn) if r["tiles"] % pcn == 0)
-    n = len(full)
-    mx = statistics.mean(t for t, _ in full)
-    my = statistics.mean(u for _, u in full)
-    slope = sum((t - mx) * (u - my) for t, u in full) / sum((t - mx) ** 2 for t, _ in full)
-    segs = []
-    for (t0, u0), (t1, u1) in zip(full, full[1:]):
-        c0, c1 = t0 // pcn, t1 // pcn
-        segs.append((c0, c1, (u1 - u0) / (c1 - c0), t0 % 8, t1 % 8))
-    return segs, slope * pcn, n
-
-
-def panel(ax, pcn, names, title, shade=None):
-    style(ax)
-    segs, avg, n = coarse(pcn)
-    single = single_steps(names, pcn)
-    if shade:
-        ax.axvspan(shade[0] + 0.5, shade[1] + 0.5, color=GRID, alpha=0.6, lw=0, zorder=0)
-        ax.text((shade[0] + shade[1]) / 2 + 0.5, 4.6, "F0 → b\n(96 → 101 cores)", ha="center", fontsize=9, color=INK2)
-    ax.axhline(avg, ls="--", color=INK2, lw=1.2, zorder=1)
-    ax.text(
-        80.6,
-        avg + 0.25,
-        f"average step {avg:.2f} µs\n(slope of a line through the coarse points)",
-        fontsize=8.5,
-        color=INK2,
-    )
-    for c0, c1, s, r0, r1 in segs:
-        if pcn == 66:
-            color = UP if (r0, r1) == (4, 0) else DOWN
-        else:
-            color = MIXED
-        ax.plot([c0 + 0.5, c1 + 0.5], [s, s], color=color, lw=3.2, solid_capstyle="butt", zorder=2)
-    xs = sorted(single)
-    ax.plot(xs, [single[c] for c in xs], color=SINGLE, lw=1.4, marker="o", ms=6, mec=SURFACE, mew=1.0, zorder=3)
-    for i, c in enumerate(xs):
-        v = single[c]
-        near_prev = i > 0 and abs(single[xs[i - 1]] - v) < 0.8
-        near_next = i + 1 < len(xs) and abs(single[xs[i + 1]] - v) < 0.8
-        ha, dx = ("right", -0.15) if near_next and not near_prev else ("left", 0.15) if near_prev else ("center", 0)
-        dy = 0.45 if v >= avg else -0.85
-        ax.text(c + dx, v + dy, f"{v:.1f}", ha=ha, fontsize=8.5, color=INK)
-    if 99 in single:
-        ax.plot([99], [single[99]], ls="", marker="o", ms=11, mfc="none", mec=HI, mew=2.0, zorder=4)
-    ax.set_xlim(80, 111)
-    ax.set_ylim(4, 19.5)
-    ax.yaxis.grid(True, color=GRID, lw=0.8)
-    ax.set_axisbelow(True)
-    ax.set_xlabel("core count after the step (cores 1-110 fill the grid row by row)", color=INK2, fontsize=10)
-    ax.set_ylabel("tail time added per added core, µs per call", color=INK2, fontsize=10)
-    ax.set_title(title, loc="left", fontsize=12, fontweight="bold", color=INK)
-    return segs, single, avg
+def cls(t):
+    return t % 8 if t % 4 == 0 else None
 
 
 def main(stem):
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": SURFACE, "savefig.facecolor": SURFACE})
-    fig, (a, b) = plt.subplots(1, 2, figsize=(17, 6.6), gridspec_kw={"wspace": 0.18})
-    fig.subplots_adjust(left=0.05, right=0.985, top=0.9, bottom=0.25)
-    sa = panel(a, 66, ("fine_codex", "prod_codex"), "66 tiles per core", shade=(96, 101))
-    sb = panel(b, 75, ("core99_codex",), "75 tiles per core")
-    handles = [
-        Line2D([], [], color=SINGLE, marker="o", lw=1.4),
-        Line2D([], [], color=UP, lw=3.2),
-        Line2D([], [], color=DOWN, lw=3.2),
-        Line2D([], [], color=MIXED, lw=3.2),
-        Line2D([], [], ls="", marker="o", ms=11, mfc="none", mec=HI, mew=2.0),
-        Line2D([], [], ls="--", color=INK2),
-    ]
-    labels = [
-        "one core added (widths not ≡ 0 or 4 mod 8)",
-        "2 cores added, width ≡ 4 → ≡ 0 mod 8 (penalty grows: step reads high)",
-        "2 cores added, width ≡ 0 → ≡ 4 mod 8 (penalty shrinks: step reads low)",
-        "3 cores added, mixed width residues",
-        "the 99th core",
-        "average step (line fit)",
-    ]
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.0))
+    by = load()
+    fig, ax = plt.subplots(figsize=(14, 7))
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.92, bottom=0.17)
+    style(ax)
+    cs = list(by)
+    med = {c: statistics.median(u for _, u in by[c]) for c in cs}
+    boxed = [c for c in cs if len(by[c]) >= 3]
+    ax.boxplot(
+        [[u for _, u in by[c]] for c in boxed],
+        positions=boxed,
+        widths=0.6,
+        showfliers=False,
+        manage_ticks=False,
+        whis=(0, 100),
+        medianprops={"color": INK, "lw": 1.4},
+        boxprops={"color": INK2},
+        whiskerprops={"color": INK2},
+        capprops={"color": INK2},
+        zorder=2,
+    )
+    ax.plot(cs, [med[c] for c in cs], color=INK2, lw=1.3, zorder=1)
+    for c in cs:
+        for t, u in by[c]:
+            ax.plot(
+                c,
+                u,
+                ls="",
+                marker="o",
+                ms=4,
+                color=CLASS[cls(t)][1],
+                mec=SURFACE,
+                mew=0.5,
+                zorder=3,
+            )
+    for c, t, name in ((96, 6322, "F0"), (101, 6652, "b")):
+        u = dict(by[c])[t]
+        ax.annotate(
+            name,
+            (c, u),
+            xytext=(-26, 14),
+            textcoords="offset points",
+            fontsize=11,
+            fontweight="bold",
+            color=INK,
+            arrowprops={"arrowstyle": "-", "color": INK, "lw": 0.8},
+        )
+    ax.set_xlim(79, 111)
+    ax.set_xticks(range(80, 111, 2))
+    ax.yaxis.grid(True, color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    ax.set_xlabel(
+        "cores used by the tail (66 weight tiles per core; cores fill the 11 x 10 grid row by row)", color=INK2
+    )
+    ax.set_ylabel("DRAM-tail time per call, µs (axis not from 0)", color=INK2)
+    ax.set_title("DRAM-tail time against core count", loc="left", fontsize=13, fontweight="bold", color=INK)
+    ax.legend(
+        [Line2D([], [], ls="", marker="o", color=CLASS[k][1]) for k in CLASS] + [Line2D([], [], color=INK2, lw=1.3)],
+        [CLASS[k][0] for k in CLASS] + ["median per core count (box: all widths at that core count)"],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.1),
+        ncol=4,
+        frameon=False,
+        fontsize=9.5,
+    )
     for ext in ("png", "pdf"):
         fig.savefig(f"{stem}.{ext}", dpi=150)
-    for name, (segs, single, avg) in (("66", sa), ("75", sb)):
-        print(f"{name} tiles per core: average step {avg:.2f}")
-        print("  single:", {c: round(v, 1) for c, v in single.items()})
-        print("  coarse:", [(c0, c1, round(s, 2), f"{r0}->{r1}") for c0, c1, s, r0, r1 in segs])
+    for c in cs:
+        print(c, len(by[c]), round(med[c], 1), [(t, round(u, 1)) for t, u in by[c]][:4])
 
 
 if __name__ == "__main__":
