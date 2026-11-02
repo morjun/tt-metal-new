@@ -8,7 +8,9 @@ fill it), only on the width's class mod 8 (≡ 0, ≡ 4, other). At 96-102 cores
 through the per-core-count median of that class's widths. At 80-94 and 104-110 (one full-core width 66 x cores each,
 always ≡ 0 or 4 mod 8): one grey line, joined to the class line of the full-core width's class at 96 and 102.
 
-    python research_codes/mm_profiling/plot_tail_core_steps.py <figure path stem>
+    python research_codes/mm_profiling/plot_tail_core_steps.py <figure path stem> [--zoom]
+
+--zoom: 96-102 cores only (the class lines; no full-core-width line).
 """
 
 import json
@@ -48,7 +50,7 @@ def cls(t):
 INNER = range(96, 103)
 
 
-def main(stem):
+def main(stem, zoom=False):
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": SURFACE, "savefig.facecolor": SURFACE})
     by = load()
     fig, ax = plt.subplots(figsize=(14, 7))
@@ -71,8 +73,9 @@ def main(stem):
         (left + [lo], [outer[c] for c in left] + [join_lo]),
         ([hi] + right, [join_hi] + [outer[c] for c in right]),
     ):
-        ax.plot(xs, ys, color=INK2, lw=1.3, zorder=1)
-    for c in outer:
+        if not zoom:
+            ax.plot(xs, ys, color=INK2, lw=1.3, zorder=1)
+    for c in [] if zoom else outer:
         ax.plot(c, outer[c], ls="", marker="o", ms=6, color=CLASS[cls(PCN * c)][1], mec=SURFACE, mew=0.6, zorder=3)
     for k, pts in lines.items():
         xs = sorted(pts)
@@ -82,13 +85,13 @@ def main(stem):
             96,
             6322,
             "head in L1: 17 tiles per core x 110 cores (59,840 columns)\nDRAM tail: 6,322 tiles on 96 cores",
-            (84, 880),
+            (96.3, 838) if zoom else (84, 880),
         ),
         (
             101,
             6652,
             "head in L1: 14 tiles per core x 110 cores (49,280 columns)\nDRAM tail: 6,652 tiles on 101 cores",
-            (100.5, 790),
+            (99.7, 866) if zoom else (100.5, 790),
         ),
     )
     for c, t, name, off in arms:
@@ -102,8 +105,13 @@ def main(stem):
             color=INK,
             arrowprops={"arrowstyle": "-", "color": INK, "lw": 0.8},
         )
-    ax.set_xlim(79, 111)
-    ax.set_xticks(range(80, 111, 2))
+    if zoom:
+        ax.set_xlim(95.6, 102.4)
+        ax.set_xticks(INNER)
+        ax.set_ylim(834, 915)
+    else:
+        ax.set_xlim(79, 111)
+        ax.set_xticks(range(80, 111, 2))
     ax.yaxis.grid(True, color=GRID, lw=0.8)
     ax.set_axisbelow(True)
     ax.set_xlabel(
@@ -111,13 +119,17 @@ def main(stem):
     )
     ax.set_ylabel("DRAM-tail time per call, µs (axis not from 0)", color=INK2)
     ax.set_title("DRAM-tail time against core count", loc="left", fontsize=13, fontweight="bold", color=INK)
+    handles = [Line2D([], [], color=CLASS[k][1], lw=1.8, marker="o") for k in CLASS]
+    labels = [CLASS[k][0] if zoom else f"{CLASS[k][0]} (96-102 cores: median over those widths)" for k in CLASS]
+    if not zoom:
+        handles.append(Line2D([], [], color=INK2, lw=1.3))
+        labels.append("80-94, 104-110 cores: full-core width (66 x cores), dot coloured by its class")
     ax.legend(
-        [Line2D([], [], color=CLASS[k][1], lw=1.8, marker="o") for k in CLASS] + [Line2D([], [], color=INK2, lw=1.3)],
-        [f"{CLASS[k][0]} (96-102 cores: median over those widths)" for k in CLASS]
-        + ["80-94, 104-110 cores: full-core width (66 x cores), dot coloured by its class"],
+        handles,
+        labels,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.1),
-        ncol=2,
+        ncol=3 if zoom else 2,
         frameon=False,
         fontsize=9.5,
     )
@@ -129,4 +141,4 @@ def main(stem):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], zoom="--zoom" in sys.argv[2:])
