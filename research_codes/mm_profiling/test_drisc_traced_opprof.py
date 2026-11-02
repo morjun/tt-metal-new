@@ -10,7 +10,9 @@ profiler after each replay, so the profile has the ops back to back as in the ti
     python -m tracy -r -p -v -m pytest -s -q research_codes/mm_profiling/test_drisc_traced_opprof.py
 """
 
+import hashlib
 import os
+
 from loguru import logger
 
 import ttnn
@@ -45,6 +47,10 @@ def test_traced_iteration_opprof(mesh_device, reset_seeds):
             ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
             if FLUSH:
                 ttnn.ReadDeviceProfiler(mesh_device)
+        # output fingerprint after the replays, as the standalone runner logs it, so profiled cells are checked too
+        h_bytes = ttnn.to_torch(ttnn.get_device_tensors(hidden)[0]).float().numpy().tobytes()
+        tok = ttnn.to_torch(ttnn.get_device_tensors(idx)[0]).flatten()[:1].tolist()
+        logger.info(f"[fused-k] K=3 output: token={tok} hidden_sha256={hashlib.sha256(h_bytes).hexdigest()[:16]}")
         ttnn.release_trace(mesh_device, tid)
         idx.deallocate(True)
         hidden.deallocate(True)

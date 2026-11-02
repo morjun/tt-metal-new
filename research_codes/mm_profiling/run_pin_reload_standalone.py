@@ -88,6 +88,21 @@ def arm_spec(arm):
     if arm.endswith("+hybrid"):
         base, extra, width = arm_spec(arm[: -len("+hybrid")])
         return base, {**extra, "TT_METAL_ALLOCATOR_MODE_HYBRID": "1"}, width
+    m = re.search(r"\+timeline(\d+)$", arm)
+    if m:
+        # per-core timeline markers in the 1D-mcast matmuls with Kt x Nt = 32 x 256 (up / gate_proj), marker-set mask
+        # (TT_MM1D_TIMELINE -> MM_TIMELINE in the in0 / in1 / compute kernels, needs build_codex_current; record §9.2b
+        # M3). Stripped right after "+hybrid", like "+niusample"
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "TT_MM1D_TIMELINE": m.group(1), "TT_MM1D_TIMELINE_SHAPE": "32x256"}, width
+    m = re.search(r"\+niusample(\d*)$", arm)
+    if m:
+        # sample the 1D-mcast in1 reader's NIU read-word counter per block, and with a number every that many
+        # wall-clock ticks (TT_MM1D_IN1_NIU_SAMPLE -> MM_IN1_NIU_SAMPLE in the in1 reader, needs build_codex_current;
+        # record §9.2 item 6b). Stripped right after "+hybrid", before the
+        # pin and slice suffixes, so it can follow them
+        base, extra, width = arm_spec(arm[: m.start()])
+        return base, {**extra, "TT_MM1D_IN1_NIU_SAMPLE": m.group(1) or "1"}, width
     m = re.search(r"\+sliceB(\d+)(?:top(\d+))?$", arm)
     if m:
         # a real head slice B: <tiles> tiles/core per-core on the cores outside the 86-core pin prefix, as stock
@@ -159,13 +174,6 @@ def arm_spec(arm):
         # sum: class A, mechanism only
         base, extra, width = arm_spec(arm[: m.start()])
         return base, {**extra, "GEMMA4_LMHEAD_DRAFT_IW": m.group(1)}, width
-    m = re.search(r"\+niusample(\d*)$", arm)
-    if m:
-        # sample the 1D-mcast in1 reader's NIU read-word counter per block, and with a number every that many
-        # wall-clock ticks (TT_MM1D_IN1_NIU_SAMPLE -> MM_IN1_NIU_SAMPLE in the in1 reader, needs build_codex_current;
-        # record §9.2 item 6b)
-        base, extra, width = arm_spec(arm[: m.start()])
-        return base, {**extra, "TT_MM1D_IN1_NIU_SAMPLE": m.group(1) or "1"}, width
     m = re.search(r"\+vc(row|col|diag|bank|fix)([0-4])$", arm)
     if m:
         # VC sweep (plan v2 T3, record §9.2e): TT_MM1D_IN1_VC_MODE = kind * 16 + k; row / col / diag = logical

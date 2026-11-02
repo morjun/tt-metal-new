@@ -77,7 +77,7 @@ def main():
             # NoC event and counter markers overflow the default profiler DRAM buffer within one iteration
             # (tt-npe's advice for NoC traces; counters fill BRISC's buffer)
             env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = os.getenv("OPPROF_PROGRAMS", "10000")
-        elif "+niusample" in arm:
+        elif "+niusample" in arm or "+timeline" in arm:
             # timed NIU samples (item 6b) overflow the default buffer the same way
             env["TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT"] = os.getenv("OPPROF_PROGRAMS", "40000")
         if mode == "noc":
@@ -93,6 +93,12 @@ def main():
             with open(LOGS / "profile_log_device.csv") as src, open(out / "niu_samples.csv", "w") as dst:
                 for i, line in enumerate(src):
                     if i < 2 or "IN1_NIU_RD_WORDS" in line:
+                        dst.write(line)
+        if "+timeline" in arm and (LOGS / "profile_log_device.csv").exists():
+            # keep only the timeline markers (record §9.2b M3) and the device-log header
+            with open(LOGS / "profile_log_device.csv") as src, open(out / "timeline_samples.csv", "w") as dst:
+                for i, line in enumerate(src):
+                    if i < 2 or ",MM_TL," in line:
                         dst.write(line)
         for name in ("cpp_device_perf_report.csv", "tracy_ops_data.csv"):
             if (LOGS / name).exists() and mode == "time":

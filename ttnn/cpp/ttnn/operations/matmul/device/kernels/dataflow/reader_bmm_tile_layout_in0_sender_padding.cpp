@@ -17,6 +17,20 @@
 #include "api/tensor/noc_traits.h"
 #include "api/dataflow/endpoints.h"
 #include "api/core_local_mem.h"
+#ifdef MM_TIMELINE
+// RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline marker, (event << 8) | block, in marker set `set` (a bit
+// of the MM_TIMELINE mask). Off unless the factory passes MM_TIMELINE (TT_MM1D_TIMELINE).
+template <uint32_t set>
+inline __attribute__((always_inline)) void mm_tl(uint32_t ev) {
+    if constexpr (((MM_TIMELINE)&set) != 0) {
+        DeviceTimestampedData("MM_TL", ev);
+    }
+}
+#define MM_TL(set, ev, blk) mm_tl<(set)>(((ev) << 8) | (blk))
+#else
+#define MM_TL(set, ev, blk) ((void)0)
+#endif
+
 void kernel_main() {
     uint32_t rt_args_idx = 0;
     // in0 tensor args
@@ -293,6 +307,7 @@ void kernel_main() {
 
                         // Barrier! make sure the reads are done
                         noc.async_read_barrier();
+                        MM_TL(2, 0x20, block);  // this block's activation read complete
 #else
                         if constexpr (extract_shard_sub_blocks) {
                             uint32_t l1_write_addr_in0 = dfb_in0.get_write_ptr();
@@ -349,7 +364,9 @@ void kernel_main() {
                         // wait until all in0 mcast destinations have atomically incremented the in0 semaphore_addr
                         // (i.e. its value should be in0_mcast_num_dests), then reset the semaphore_addr value back to
                         // zero for the next block
+                        MM_TL(2, 0x21, block);  // wait for every receiver's ready: entry
                         sender_sem.wait(in0_mcast_num_dests);
+                        MM_TL(2, 0x22, block);  // receivers ready: exit (multicast issued next)
                         sender_sem.set(0);
 
                         // Now we have the block in the CB address, we can mcast to dests!
@@ -386,6 +403,7 @@ void kernel_main() {
                             in0_mcast_dest_noc_end_x,
                             in0_mcast_dest_noc_end_y,
                             in0_mcast_num_cores);
+                        MM_TL(2, 0x23, block);  // data and VALID flag multicast issued
 #endif  // SKIP_MCAST
 
                         // Common for sharded and interleaved paths

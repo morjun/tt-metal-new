@@ -11,6 +11,20 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/dataflow/noc_semaphore.h"
+#ifdef MM_TIMELINE
+// RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline marker, (event << 8) | block, in marker set `set` (a bit
+// of the MM_TIMELINE mask). Off unless the factory passes MM_TIMELINE (TT_MM1D_TIMELINE).
+template <uint32_t set>
+inline __attribute__((always_inline)) void mm_tl(uint32_t ev) {
+    if constexpr (((MM_TIMELINE)&set) != 0) {
+        DeviceTimestampedData("MM_TL", ev);
+    }
+}
+#define MM_TL(set, ev, blk) mm_tl<(set)>(((ev) << 8) | (blk))
+#else
+#define MM_TL(set, ev, blk) ((void)0)
+#endif
+
 void kernel_main() {
     // in0 mcast args
     const uint32_t in0_mcast_sender_noc_x = get_arg_val<uint32_t>(0);
@@ -80,7 +94,9 @@ void kernel_main() {
                     sender_sem.up(noc, in0_mcast_sender_noc_x, in0_mcast_sender_noc_y, 1);
 
                     // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
+                    MM_TL(2, 0x28, block);  // wait for the multicast VALID flag: entry (ready already signalled)
                     receiver_sem.wait(VALID);
+                    MM_TL(2, 0x29, block);  // activation block delivered: exit
 
                     dfb_in0.push_back(in0_block_num_tiles);
                 }

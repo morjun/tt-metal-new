@@ -161,6 +161,20 @@ inline void reblock_and_untilize(
     interm_dfb.pop_front(num_tiles_in_row_of_subblocks);
 }
 
+#ifdef MM_TIMELINE
+// RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline marker, (event << 8) | block, in marker set `set` (a bit
+// of the MM_TIMELINE mask). Off unless the factory passes MM_TIMELINE (TT_MM1D_TIMELINE).
+template <uint32_t set>
+inline __attribute__((always_inline)) void mm_tl(uint32_t ev) {
+    if constexpr (((MM_TIMELINE)&set) != 0) {
+        DeviceTimestampedData("MM_TL", ev);
+    }
+}
+#define MM_TL(set, ev, blk) mm_tl<(set)>(((ev) << 8) | (blk))
+#else
+#define MM_TL(set, ev, blk) ((void)0)
+#endif
+
 void kernel_main() {
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
@@ -317,8 +331,11 @@ void kernel_main() {
                         PACK((pack_reconfig_data_format(mm_partials_dfb_id)));
                     }
 
+                    UNPACK((MM_TL(8, 0x30, block)));  // in0 wait entry
                     in0_dfb.wait_front(in0_block_num_tiles);
+                    UNPACK((MM_TL(8, 0x31, block)));  // in0 wait exit
                     in1_dfb.wait_front(in1_block_num_tiles);
+                    UNPACK((MM_TL(1, 0x32, block)));  // both inputs of this block available (compute can start)
 
                     int in0_index_subblock_offset = 0;
                     for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -440,6 +457,8 @@ void kernel_main() {
                         }
                         in0_index_subblock_offset += in0_subblock_num_tiles;
                     }
+                    MATH((MM_TL(8, 0x33, block)));  // this block's math issued and done
+                    PACK((MM_TL(1, 0x34, block)));  // this block packed (last block: output pushed)
 
 #ifdef PACKER_L1_ACC
 #ifdef FUSE_BIAS

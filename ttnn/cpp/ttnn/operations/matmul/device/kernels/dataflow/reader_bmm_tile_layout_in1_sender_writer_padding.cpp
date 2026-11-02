@@ -35,6 +35,20 @@ inline void niu_sample_if_due(uint32_t& due) {
 }
 #endif
 
+#ifdef MM_TIMELINE
+// RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline marker, (event << 8) | block, in marker set `set` (a bit
+// of the MM_TIMELINE mask). Off unless the factory passes MM_TIMELINE (TT_MM1D_TIMELINE).
+template <uint32_t set>
+inline __attribute__((always_inline)) void mm_tl(uint32_t ev) {
+    if constexpr (((MM_TIMELINE)&set) != 0) {
+        DeviceTimestampedData("MM_TL", ev);
+    }
+}
+#define MM_TL(set, ev, blk) mm_tl<(set)>(((ev) << 8) | (blk))
+#else
+#define MM_TL(set, ev, blk) ((void)0)
+#endif
+
 void kernel_main() {
     // READER
     uint32_t rt_args_idx = 0;
@@ -257,8 +271,10 @@ void kernel_main() {
 
 //  READER
 #ifdef IN1_SHARDED
+    MM_TL(1, 0x10, 0);  // kernel start (before the shard's one reserve / push)
     dfb_in1.reserve_back(in1_block_num_tiles * num_blocks_inner_dim);
     dfb_in1.push_back(in1_block_num_tiles * num_blocks_inner_dim);
+    MM_TL(1, 0x14, 0);  // whole weight shard pushed, once
 #else
     uint32_t l1_write_addr_in1;
 
@@ -310,6 +326,9 @@ void kernel_main() {
     uint32_t niu_block = 0;
     niu_sample();
     uint32_t niu_due = get_timestamp_32b() + MM_IN1_NIU_SAMPLE;
+#endif
+#ifndef IN1_SHARDED
+    MM_TL(1, 0x10, 0);  // kernel start (before the first weight read is issued)
 #endif
     for (uint32_t b = 0; b < batch; ++b) {
         uint32_t in1_batch_tile_id = in1_tensor_start_tile_id;
@@ -449,7 +468,9 @@ void kernel_main() {
                         noc.async_read_barrier();
 #elif !defined(IN1_SHARDED)
                         // Operand 1 - interleaved
+                        MM_TL(4, 0x11, block);  // CB-space wait entry
                         dfb_in1.reserve_back(in1_block_num_tiles);
+                        MM_TL(1, 0x12, block);  // CB-space wait exit: this block's weight reads are issued next
                         uint32_t in1_write_offset = 0;
                         uint64_t in1_start_address =
                             dfb_in1.get_write_ptr();  // copy start address of block, to be used for mcasting
@@ -506,6 +527,7 @@ void kernel_main() {
                         }
 #endif
                         noc.async_read_barrier();
+                        MM_TL(1, 0x13, block);  // this block's weight reads complete (read barrier returned)
 #ifdef MM_IN1_NIU_SAMPLE
                         // RESEARCH (gemma4-12b record §9.2, item 6b): this core's NIU master counter of read data words
                         // received on this RISC's NoC, with a timestamp, after every k-th block's read barrier: the
@@ -720,7 +742,9 @@ void kernel_main() {
                                 subblock_tiles_addr_skip = padded_subblock_tiles_addr_skip;
                             }
 
+                            MM_TL(4, 0x15, sbw);  // output wait entry (writer waits for the packed subblock)
                             dfb_out.wait_front(out_subblock_tile_count);
+                            MM_TL(4, 0x16, sbw);  // output wait exit
                             uint32_t out_read_offset = 0;
 
                             for (uint32_t h = 0; h < out_subblock_h_; ++h) {
@@ -792,6 +816,7 @@ void kernel_main() {
         batch * out_num_nonzero_subblocks_h * out_num_nonzero_subblocks_w * out_subblock_w * out_subblock_h);
 #endif
     noc.async_write_barrier();
+    MM_TL(1, 0x17, 0);  // all output writes complete
 #if MM_IN1_VC_MODE != 0
     noc.async_read_barrier();
     while (!noc_cmd_buf_ready(noc_index, read_cmd_buf)) {

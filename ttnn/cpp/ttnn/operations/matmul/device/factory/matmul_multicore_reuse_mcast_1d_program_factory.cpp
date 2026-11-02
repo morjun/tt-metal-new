@@ -598,6 +598,19 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     if (const char* niu_sample = std::getenv("TT_MM1D_IN1_NIU_SAMPLE"); niu_sample != nullptr) {
         mm_kernel_in1_sender_writer_defines["MM_IN1_NIU_SAMPLE"] = niu_sample;
     }
+    // RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline markers (MM_TIMELINE = marker-set mask) in the in0
+    // sender / receiver, in1 reader / writer and compute kernels of the matmuls whose Kt x Nt equals
+    // TT_MM1D_TIMELINE_SHAPE ("<Kt>x<Nt>"; every mcast-in0 matmul if unset). Off unless TT_MM1D_TIMELINE is set.
+    std::map<std::string, std::string> mm_kernel_in0_receiver_defines;
+    if (const char* timeline = std::getenv("TT_MM1D_TIMELINE"); timeline != nullptr) {
+        const char* timeline_shape = std::getenv("TT_MM1D_TIMELINE_SHAPE");
+        if (timeline_shape == nullptr || std::string(timeline_shape) == std::to_string(K) + "x" + std::to_string(N)) {
+            mm_kernel_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in0_sender_writer_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in0_receiver_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in1_sender_writer_defines["MM_TIMELINE"] = timeline;
+        }
+    }
 
     if (fuse_op && fused_op_signaler->is_all_gather()) {
         // Create semaphores
@@ -681,6 +694,7 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
                 .processor = tt_metal::DataMovementProcessor::RISCV_1,
                 .noc = in0_noc,
                 .compile_args = in0_receiver_compile_time_args,
+                .defines = mm_kernel_in0_receiver_defines,
                 .named_compile_args = {
                     {"cb_in0", tt::CBIndex::c_0},
                 }});
@@ -3572,6 +3586,19 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     if (const char* niu_sample = std::getenv("TT_MM1D_IN1_NIU_SAMPLE"); niu_sample != nullptr) {
         mm_kernel_in1_sender_writer_defines["MM_IN1_NIU_SAMPLE"] = niu_sample;
     }
+    // RESEARCH (gemma4-12b record §9.2b, M3): per-core timeline markers (MM_TIMELINE = marker-set mask) in the in0
+    // sender / receiver, in1 reader / writer and compute kernels of the matmuls whose Kt x Nt equals
+    // TT_MM1D_TIMELINE_SHAPE ("<Kt>x<Nt>"; every mcast-in0 matmul if unset). Off unless TT_MM1D_TIMELINE is set.
+    std::map<std::string, std::string> mm_kernel_in0_receiver_defines;
+    if (const char* timeline = std::getenv("TT_MM1D_TIMELINE"); timeline != nullptr) {
+        const char* timeline_shape = std::getenv("TT_MM1D_TIMELINE_SHAPE");
+        if (timeline_shape == nullptr || std::string(timeline_shape) == std::to_string(K) + "x" + std::to_string(N)) {
+            mm_kernel_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in0_sender_writer_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in0_receiver_defines["MM_TIMELINE"] = timeline;
+            mm_kernel_in1_sender_writer_defines["MM_TIMELINE"] = timeline;
+        }
+    }
 
     ////////////////////////////////////////////////////////////////////////////
     //                      Build Kernel Descriptors
@@ -3662,6 +3689,7 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         in0_receiver_kernel_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
         in0_receiver_kernel_desc.core_ranges = in0_mcast_receivers;
         in0_receiver_kernel_desc.compile_time_args = in0_receiver_compile_time_args;
+        in0_receiver_kernel_desc.defines = map_to_defines(mm_kernel_in0_receiver_defines);
         in0_receiver_kernel_desc.named_compile_time_args = {
             {"cb_in0", tt::CBIndex::c_0},
         };
