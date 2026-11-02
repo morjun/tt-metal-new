@@ -3,8 +3,8 @@
 
 Left: per-step change of each part of the drafter (traced time-mode profile, analyze_p4_attr.py), µs per 3-step
 draft, with the standalone step (median of 3 rounds) as a marker. Middle: for the 330 head tiles (a vs b) and the up
-L0 pin (c vs d), the DRAM read window the move to L1 removes (NIU samples, tail_slow_niu cells; run
-item6/analyze_niu_instances.py on them first) beside the op time it saves (profiled D); record §9.2b, "Read windows
+L0 pin (c vs d), the DRAM-fed reader window the move to L1 removes (NIU samples, tail_slow_niu cells; run
+item6/analyze_niu_instances.py on them first) beside the op time it saves (profiled D); record §9.2b, "Reader windows
 and residuals". Right: the DRAM tail's time per
 call above F0's per-tile rate, against its width (every vc1 + ep0 time-mode profile with that tail).
 
@@ -170,14 +170,14 @@ def main(outdir):
 
     save(fig, "fig24a_h1_step_parts")
 
-    # middle: DRAM read window each weight removes (NIU, tail_slow_niu cells of arms a / b / c) against the op time
-    # its move to L1 saves (profiled D); the gap is the residual P (record §9.2b, "Read windows and residuals")
+    # middle: DRAM-fed reader window each weight removes (NIU, tail_slow_niu cells of arms a / b / c) against the op time
+    # its move to L1 saves (profiled D); the gap is the residual P (record §9.2b, "Reader windows and residuals")
     a, b, c, d = prof["00"], prof["01"], prof["02"], prof["03"]
     up_dram, up_l1 = c["up_proj L0"], d["up_proj L0"]
     tail_add = b["head DRAM tail"] - a["head DRAM tail"]
     f0_tiles = 202304 // 32
     per_avg = a["head DRAM tail"] / 3 / f0_tiles  # F0 tail average, µs per tile per call (right panel)
-    head_vis = a["head slice A"] - b["head slice A"]  # slice A's per-tile time for the 3 tiles per core
+    head_vis = a["head slice A"] - b["head slice A"]  # slice A's measured time change, 17 vs 14 tiles per core
     head_d = tail_add - head_vis
     up_d = up_dram - up_l1
     niu = {
@@ -203,7 +203,7 @@ def main(outdir):
         ax.text(
             max(r, dd) + 22,
             i,
-            f"difference\n{r - dd:.1f}",
+            f"residual\n{r - dd:.1f}",
             va="center",
             fontsize=9.5,
             color=INK2,
@@ -220,7 +220,7 @@ def main(outdir):
             plt.Rectangle((0, 0), 1, 1, color="#e69f00"),
         ],
         labels=[
-            "DRAM read time removed (hardware read counters: reader start to last weight byte)",
+            "DRAM-fed reader window removed (hardware read counters: earliest first sample to latest last sample)",
             "matmul time saved (time with the weight in DRAM − time with it in SRAM)",
         ],
         loc="upper center",
@@ -230,7 +230,7 @@ def main(outdir):
         ncol=1,
     )
     ax.set_title(
-        "DRAM read time removed vs matmul time saved",
+        "DRAM-fed reader window removed vs matmul time saved",
         loc="left",
         fontsize=12.5,
         fontweight="bold",
