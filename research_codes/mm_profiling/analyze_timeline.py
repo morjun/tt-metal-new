@@ -28,6 +28,7 @@ with the latest 0x17. Reports per (arm, mask), median over calls:
 import argparse
 import bisect
 import csv
+import gzip
 import json
 import re
 import statistics
@@ -43,7 +44,8 @@ MHZ = 1350.0
 
 def read_markers(path):
     out = []
-    with open(path) as f:
+    path = path if path.exists() else path.with_name(path.name + ".gz")  # gzip-compressed cells
+    with gzip.open(path, "rt") if path.suffix == ".gz" else open(path) as f:
         next(f)
         for r in csv.DictReader(f, skipinitialspace=True):
             if (r.get("zone name") or "").strip() == "MM_TL":
@@ -97,6 +99,7 @@ def call_metrics(marks, l1_fed):
         m[f"b{b}_wait_before"] = r - prev  # from the previous block packed (or start) to these inputs available
         m[f"b{b}_compute"] = pk - r
         m[f"b{b}_weight_avail"] = (w[b] - t0) if w[b] is not None else None
+        m[f"b{b}_weight_issue"] = (ev[(0x12, b)] - t0) if (0x12, b) in ev else None
         m[f"b{b}_act_avail"] = (act[b] - t0) if act[b] is not None else None
         if w[b] is not None and act[b] is not None:
             m[f"b{b}_binding"] = "weight" if w[b] >= act[b] else "activation"
@@ -238,7 +241,7 @@ def main():
             _, ups = up_calls(d)
             base_dur["d" if l1_fed else "c"] += [u[2] for u in ups]
             continue
-        if not (d / "timeline_samples.csv").exists():
+        if not ((d / "timeline_samples.csv").exists() or (d / "timeline_samples.csv.gz").exists()):
             continue
         res.append(cell_analysis(d, l1_fed, int(m.group(1))))
     out = {

@@ -28,6 +28,7 @@ The counter counts every read on that NoC at that core; the in1 reader is the on
 import argparse
 import bisect
 import csv
+import gzip
 import json
 import statistics
 import sys
@@ -46,7 +47,8 @@ BIN_US = 2.0
 def read_samples(path):
     """[(cycle, (core_x, core_y), counter)] from the device-log rows of IN1_NIU_RD_WORDS."""
     out = []
-    with open(path) as f:
+    path = path if path.exists() else path.with_name(path.name + ".gz")  # gzip-compressed cells
+    with gzip.open(path, "rt") if path.suffix == ".gz" else open(path) as f:
         next(f)  # "ARCH: ..., CHIP_FREQ[MHz]: ..." line
         for row in csv.DictReader(f, skipinitialspace=True):
             if (row.get("zone name") or "").strip() == "IN1_NIU_RD_WORDS":
