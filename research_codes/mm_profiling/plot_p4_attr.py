@@ -7,7 +7,10 @@ cores) save 159.1 µs per draft in L1 but the up L0 pin only 80.5: a bridge with
 the tail's full-core rate (134.9 ns per tile per call; record §9.2b, "Pin-value reasoning"). Right: the DRAM tail's time per
 call above F0's per-tile rate, against its width (every vc1 + ep0 time-mode profile with that tail).
 
-    python research_codes/mm_profiling/plot_p4_attr.py <figure path stem>
+    python research_codes/mm_profiling/plot_p4_attr.py <figures dir>
+
+Writes three separate figures: fig24a_h1_step_parts (left), fig24b_head_vs_pin_saving (middle),
+fig24c_tail_above_rate (right).
 """
 
 import csv
@@ -98,7 +101,7 @@ def style(ax):
     ax.tick_params(colors=INK2, labelsize=9.5)
 
 
-def main(stem):
+def main(outdir):
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": SURFACE, "savefig.facecolor": SURFACE})
     prof = {
         d.name[:2]: cell(d)[0] for d in sorted((ROOT / "opprof_p4_attr").iterdir()) if (d / "ops_perf.csv").exists()
@@ -110,13 +113,14 @@ def main(stem):
     arms = [d.name.split("_", 2)[2] for d in sorted((ROOT / "opprof_p4_attr").iterdir()) if d.is_dir()]
     stand = {f"{i:02d}": statistics.median(med[a]) * 1e3 for i, a in enumerate(arms)}
 
-    fig = plt.figure(figsize=(23, 7.6))
-    gs = fig.add_gridspec(
-        1, 3, width_ratios=[1.2, 0.85, 0.85], wspace=0.62, left=0.105, right=0.985, top=0.9, bottom=0.24
-    )
+    def save(fig, name):
+        for ext in ("png", "pdf"):
+            fig.savefig(f"{outdir}/{name}.{ext}", dpi=150)
+        plt.close(fig)
 
     # left: per-step part changes
-    ax = fig.add_subplot(gs[0])
+    fig, ax = plt.subplots(figsize=(10.5, 7.6))
+    fig.subplots_adjust(left=0.24, right=0.97, top=0.9, bottom=0.27)
     style(ax)
     ys = range(len(STEPS))
     for i, (label, cur, prev) in enumerate(STEPS):
@@ -163,6 +167,8 @@ def main(stem):
         fontsize=9,
     )
 
+    save(fig, "fig24a_h1_step_parts")
+
     # middle: bridge from up L0's saving to the head columns' saving, both reads priced at the tail's full-core rate
     a, b, c, d = prof["00"], prof["01"], prof["02"], prof["03"]
     up_dram, up_l1 = c["up_proj L0"], d["up_proj L0"]
@@ -198,7 +204,8 @@ def main(stem):
         ),
         ("= 330 head tiles in L1 save\n(tail time − slice A per-tile time)", head_d, "total", "#5d6b7e"),
     ]
-    ax = fig.add_subplot(gs[1])
+    fig, ax = plt.subplots(figsize=(10, 5.6))
+    fig.subplots_adjust(left=0.38, right=0.96, top=0.89, bottom=0.13)
     style(ax)
     run = 0.0
     for i, (label, v, kind, color) in enumerate(rows):
@@ -221,8 +228,11 @@ def main(stem):
         "Why 330 head tiles in L1 save 159 but up L0 only 80.5", loc="left", fontsize=12.5, fontweight="bold", color=INK
     )
 
+    save(fig, "fig24b_head_vs_pin_saving")
+
     # right: tail time above F0's per-tile rate, vs width
-    ax = fig.add_subplot(gs[2])
+    fig, ax = plt.subplots(figsize=(8.5, 6.6))
+    fig.subplots_adjust(left=0.12, right=0.96, top=0.9, bottom=0.22)
     style(ax)
     marks = {"66 / ow6": ("o", "#0072b2"), "75 / ow5": ("s", "#e69f00")}
     pts = {}
@@ -266,8 +276,7 @@ def main(stem):
         frameon=False,
         fontsize=9,
     )
-    for ext in ("png", "pdf"):
-        fig.savefig(f"{stem}.{ext}", dpi=150)
+    save(fig, "fig24c_tail_above_rate")
     print(f"up L0 DRAM {up_dram:.1f}, L1 {up_l1:.1f}; tail +{tail_add:.1f}; slice A per-tile {head_vis:.1f}")
     for label, v, kind, _ in rows:
         print(f"  {label:50s} {v:7.1f}")
