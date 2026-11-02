@@ -97,7 +97,7 @@ void kernel_main() {
                     // wait on in0 semaphore value to become VALID (set by mcast sender after it multicasts data)
                     MM_TL(2, 0x28, block);  // wait for the multicast VALID flag: entry (ready already signalled)
                     receiver_sem.wait(VALID);
-                    MM_TL(2, 0x29, block);  // activation block delivered: exit
+                    MM_TL(2 | 32, 0x29, block);  // activation block delivered: exit
 
                     dfb_in0.push_back(in0_block_num_tiles);
                 }

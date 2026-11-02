@@ -85,8 +85,10 @@ def call_metrics(marks, l1_fed):
     nb = 1 + max(b for (e, b) in ev if e == 0x32)
     m = {"marker_span": max(ends.values()) - t0, "slow_core": slow, "slow_end": ends[slow] - t0}
     act = {}
+    snd = [c for c, v in marks.items() if (0x23, 0) in v]
     for b in range(nb):
-        act[b] = ev.get((0x29, b), ev.get((0x23, b)))  # receiver: VALID arrived; sender core: multicast issued
+        # receiver: VALID arrived (0x29); else the sender's multicast issued (0x23), on this core or the sender core
+        act[b] = ev.get((0x29, b), ev.get((0x23, b), marks[snd[0]].get((0x23, b)) if snd else None))
     w = {b: ev.get((0x14, 0)) if l1_fed else ev.get((0x13, b)) for b in range(nb)}
     prev = t0
     for b in range(nb):
@@ -119,6 +121,43 @@ def call_metrics(marks, l1_fed):
             conc.append(tot)
         m["concurrency_median_core"] = statistics.median(conc)
         m["concurrency_slow_core"] = conc[list(marks).index(slow)]
+    # activation path (sets 2 / 16 / 32): the sender core (the one with 0x20) and the receivers
+    snd = [c for c, v in marks.items() if (0x20, 0) in v]
+    if snd:
+        sv = marks[snd[0]]
+        for b in range(nb):
+            if (0x20, b) in sv:
+                m[f"s{b}_act_read_done"] = sv[(0x20, b)] - t0
+            if (0x21, b) in sv and (0x22, b) in sv:
+                m[f"s{b}_ready_wait"] = sv[(0x22, b)] - sv[(0x21, b)]
+            if (0x23, b) in sv and (0x22, b) in sv:
+                m[f"s{b}_mcast_issue"] = sv[(0x23, b)] - sv[(0x22, b)]
+            if (0x23, b) in sv:
+                m[f"s{b}_mcast_issued"] = sv[(0x23, b)] - t0
+    for b in range(nb):
+        rd = [v[(0x29, b)] - t0 for v in marks.values() if (0x29, b) in v]
+        if rd:
+            m[f"r{b}_delivered_median"] = statistics.median(rd)
+        rw = [v[(0x29, b)] - v[(0x28, b)] for v in marks.values() if (0x28, b) in v and (0x29, b) in v]
+        if rw:
+            m[f"r{b}_valid_wait_median"] = statistics.median(rw)
+    # output (set 4 on BRISC): the writer's last wait exit to all writes complete, on the slowest core
+    outs = sorted(t for (e, b), t in ev.items() if e == 0x16)
+    if outs:
+        m["last_output_wait_exit_to_complete"] = ends[slow] - outs[-1]
+        m["last_pack_to_last_output_wait_exit"] = outs[-1] - ev[(0x34, nb - 1)]
+    ins = [t for (e, b), t in ev.items() if e == 0x15]
+    if ins:
+        m["first_output_wait_entry"] = min(ins) - t0
+    # last pack -> output complete on every core (median, max) and where the slowest one is
+    opk = [v[(0x17, 0)] - v[(0x34, nb - 1)] for v in marks.values() if (0x17, 0) in v and (0x34, nb - 1) in v]
+    m["output_after_last_pack_median_core"] = statistics.median(opk)
+    m["output_after_last_pack_max_core"] = max(opk)
+    m["slow_core_str"] = f"{slow[0]},{slow[1]}"
+    # spread of the cores' completion times (the op ends at the slowest)
+    e_sorted = sorted(ends.values())
+    m["core_end_spread"] = e_sorted[-1] - e_sorted[0]
+    m["core_end_median"] = statistics.median(e_sorted) - t0
     # per-core compute total (sum of block compute) median over cores
     comp = [
         sum(v[(0x34, b)] - v[(0x32, b)] for b in range(nb) if (0x32, b) in v and (0x34, b) in v) for v in marks.values()
@@ -222,9 +261,12 @@ def main():
         um = out["unmarked"].get(arm, {}).get("mean")
         dm = statistics.mean(durs)
         calls = [c for r in rs for c in r["calls"]]
-        keys = sorted({k for c in calls for k in c if k not in ("slow_core",) and not k.endswith("binding")})
+        keys = sorted(
+            {k for c in calls for k in c if k not in ("slow_core", "slow_core_str") and not k.endswith("binding")}
+        )
         s = {k: summarize(calls, k) for k in keys}
         s["binding"] = {f"b{b}": dict(Counter(c.get(f"b{b}_binding") for c in calls)) for b in range(4)}
+        s["slow_core"] = dict(Counter(c["slow_core_str"] for c in calls).most_common(4))
         s["perturbation"] = {
             "marked": dm,
             "unmarked": um,
@@ -235,6 +277,25 @@ def main():
         print(
             f"| {arm} | {mask} | {dm:.3f} ({len(durs)}) | {um:.3f} | {dm - um:+.3f} | {0.01 * um:.3f} | {statistics.median(r['markers_per_call'] for r in rs)} | "
             f"{statistics.median(r['cores_per_call'] for r in rs)} | {rs[0]['markers_per_core_by_risc']} | {sum(r['markers_outside_any_op'] for r in rs)} |"
+        )
+    # the minimal set's intervals in every mask (agreement across marker sets)
+    print("\n## set-1 intervals by mask (median over calls, µs)")
+    keys1 = [
+        "b0_inputs_ready",
+        "b1_inputs_ready",
+        "b2_inputs_ready",
+        "b3_inputs_ready",
+        "b3_compute",
+        "output_after_last_pack",
+        "slow_end",
+    ]
+    print("| arm | mask | " + " | ".join(keys1) + " |\n|---|--:|" + "--:|" * len(keys1))
+    for k, v in summary.items():
+        arm, mask = k.split(" mask ")
+        print(
+            f"| {arm} | {mask} | "
+            + " | ".join(f"{v.get(x):.2f}" if v.get(x) is not None else "—" for x in keys1)
+            + " |"
         )
     print("\n## slowest-core path, median over calls (µs from the earliest start marker)")
     for k, s in summary.items():

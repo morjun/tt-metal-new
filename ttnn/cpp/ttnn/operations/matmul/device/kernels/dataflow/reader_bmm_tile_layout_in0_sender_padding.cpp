@@ -308,7 +308,7 @@ void kernel_main() {
 
                         // Barrier! make sure the reads are done
                         noc.async_read_barrier();
-                        MM_TL(2, 0x20, block);  // this block's activation read complete
+                        MM_TL(2 | 16, 0x20, block);  // this block's activation read complete
 #else
                         if constexpr (extract_shard_sub_blocks) {
                             uint32_t l1_write_addr_in0 = dfb_in0.get_write_ptr();
@@ -404,7 +404,7 @@ void kernel_main() {
                             in0_mcast_dest_noc_end_x,
                             in0_mcast_dest_noc_end_y,
                             in0_mcast_num_cores);
-                        MM_TL(2, 0x23, block);  // data and VALID flag multicast issued
+                        MM_TL(2 | 16, 0x23, block);  // data and VALID flag multicast issued
 #endif  // SKIP_MCAST
 
                         // Common for sharded and interleaved paths

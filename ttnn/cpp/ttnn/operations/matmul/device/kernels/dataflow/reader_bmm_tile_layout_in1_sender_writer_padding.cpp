@@ -745,7 +745,7 @@ void kernel_main() {
 
                             MM_TL(4, 0x15, sbw);  // output wait entry (writer waits for the packed subblock)
                             dfb_out.wait_front(out_subblock_tile_count);
-                            MM_TL(4, 0x16, sbw);  // output wait exit
+                            MM_TL(4 | 64, 0x16, sbw);  // output wait exit
                             uint32_t out_read_offset = 0;
 
                             for (uint32_t h = 0; h < out_subblock_h_; ++h) {

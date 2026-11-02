@@ -458,7 +458,7 @@ void kernel_main() {
                         }
                         in0_index_subblock_offset += in0_subblock_num_tiles;
                     }
-                    MATH((MM_TL(8, 0x33, block)));  // this block's math issued and done
+                    MATH((MM_TL(8 | 128, 0x33, block)));  // this block's math issued and done
                     PACK((MM_TL(1, 0x34, block)));  // this block packed (last block: output pushed)
 
 #ifdef PACKER_L1_ACC
