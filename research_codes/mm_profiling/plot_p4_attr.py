@@ -2,8 +2,9 @@
 """fig24: attribution of H1 vs F0 (gemma4-12b record §9.4).
 
 Left: per-step change of each part of the drafter (traced time-mode profile, analyze_p4_attr.py), µs per 3-step
-draft, with the standalone step (median of 3 rounds) as a marker. Middle: why the 3 head tiles' DRAM-tail time
-(+162) is twice the up L0 pin's kernel saving (−80.5): a bridge in µs per draft. Right: the DRAM tail's time per
+draft, with the standalone step (median of 3 rounds) as a marker. Middle: why the 330 head tiles (3 per core on 110
+cores) save 159.1 µs per draft in L1 but the up L0 pin only 80.5: a bridge with both weights' DRAM reads priced at
+the tail's full-core rate (134.9 ns per tile per call; record §9.2b, "Pin-value reasoning"). Right: the DRAM tail's time per
 call above F0's per-tile rate, against its width (every vc1 + ep0 time-mode profile with that tail).
 
     python research_codes/mm_profiling/plot_p4_attr.py <figure path stem>
@@ -162,22 +163,40 @@ def main(stem):
         fontsize=9,
     )
 
-    # middle: bridge from the pin's saving to the head tiles' tail time
+    # middle: bridge from up L0's saving to the head columns' saving, both reads priced at the tail's full-core rate
     a, b, c, d = prof["00"], prof["01"], prof["02"], prof["03"]
     up_dram, up_l1 = c["up_proj L0"], d["up_proj L0"]
     tail_add = b["head DRAM tail"] - a["head DRAM tail"]
     f0_tiles = 202304 // 32
-    per_up = up_dram / 3 / 256  # µs per column tile per call, up L0 from DRAM
-    per_avg = a["head DRAM tail"] / 3 / f0_tiles  # F0 tail average
-    per_marg = tail_add / 3 / 330  # tiles 15-17 x 110 cores
+    per_avg = a["head DRAM tail"] / 3 / f0_tiles  # F0 tail average, µs per tile per call (right panel)
+    RATE = 0.1349  # µs per tile per call: isolated tail, full-core widths 80-110 cores (record §9.4 stage 1)
+    head_vis = a["head slice A"] - b["head slice A"]  # slice A's per-tile work for the 3 tiles per core
+    head_d = tail_add - head_vis
+    up_d = up_dram - up_l1
+    reads_head, reads_up = round(330 * RATE * 3, 1), round(256 * RATE * 3, 1)  # 133.6, 103.6 as in the record
+    extras = tail_add - reads_head
+    up_hidden = reads_up - up_d  # up L0's work that ran during its DRAM reads
     rows = [
-        ("up L0: direct value (DRAM-fed − L1-fed)", up_dram - up_l1, "total", "#e69f00"),
-        ("+ up L0's L1-fed matmul time", up_l1, "step", "#e69f00"),
-        ("= up L0's DRAM-fed time (256 tiles)", up_dram, "total", "#e69f00"),
-        ("+ 74 more tiles moved (330 vs 256)", (330 - 256) * per_up * 3, "step", "#5d6b7e"),
-        ("+ tail's average per tile is below up L0's", (per_avg - per_up) * 330 * 3, "step", "#5d6b7e"),
-        ("+ step rate near F0 is below the average", (per_marg - per_avg) * 330 * 3, "step", "#5d6b7e"),
-        ("= DRAM-tail time of the 330 head tiles", tail_add, "total", "#5d6b7e"),
+        ("up L0 in L1 saves (DRAM-fed − L1-fed)", up_d, "total", "#e69f00"),
+        (
+            "+ more weight read from DRAM:\n330 tiles vs 256, at 134.9 ns per tile",
+            reads_head - reads_up,
+            "step",
+            "#5d6b7e",
+        ),
+        (
+            "+ extra tail time where b's width lands\n(core steps above average, width ≡ 4 mod 8)",
+            extras,
+            "step",
+            "#5d6b7e",
+        ),
+        (
+            f"+ op work that L1 makes visible:\nup L0 {up_hidden:.1f} vs head {head_vis:.1f}",
+            up_hidden - head_vis,
+            "step",
+            "#e69f00",
+        ),
+        ("= 330 head tiles in L1 save\n(tail time − slice A per-tile time)", head_d, "total", "#5d6b7e"),
     ]
     ax = fig.add_subplot(gs[1])
     style(ax)
@@ -199,7 +218,7 @@ def main(stem):
     ax.set_axisbelow(True)
     ax.set_xlabel("µs per 3-token draft (profiled op time)", color=INK2, fontsize=10)
     ax.set_title(
-        "Why the 330 head tiles cost +162 but up L0 saves 80.5", loc="left", fontsize=12.5, fontweight="bold", color=INK
+        "Why 330 head tiles in L1 save 159 but up L0 only 80.5", loc="left", fontsize=12.5, fontweight="bold", color=INK
     )
 
     # right: tail time above F0's per-tile rate, vs width
@@ -220,7 +239,9 @@ def main(stem):
     ax.set_axisbelow(True)
     ax.set_xlabel("DRAM-tail width, tiles (64 KiB = 32 columns each)", color=INK2, fontsize=10)
     ax.set_ylabel("µs per call above F0's per-tile rate", color=INK2, fontsize=10)
-    ax.set_title("The tail's cost per tile rises with width", loc="left", fontsize=12.5, fontweight="bold", color=INK)
+    ax.set_title(
+        "Tail time above F0's per-tile rate, by width", loc="left", fontsize=12.5, fontweight="bold", color=INK
+    )
     for (t, cfg), label in {
         (6322, "66 / ow6"): "F0 (96 cores)",
         (6652, "66 / ow6"): "b (101 cores)",
@@ -247,12 +268,7 @@ def main(stem):
     )
     for ext in ("png", "pdf"):
         fig.savefig(f"{stem}.{ext}", dpi=150)
-    print(
-        f"up L0 DRAM {up_dram:.1f}, L1 {up_l1:.1f}; tail +{tail_add:.1f}; µs/tile/call up {per_up:.4f} avg {per_avg:.4f} marg {per_marg:.4f}"
-    )
-    print(
-        f"GB/s: up {65536 / per_up / 1e3:.0f}, tail avg {65536 / per_avg / 1e3:.0f}, tail marg {65536 / per_marg / 1e3:.0f}"
-    )
+    print(f"up L0 DRAM {up_dram:.1f}, L1 {up_l1:.1f}; tail +{tail_add:.1f}; slice A per-tile {head_vis:.1f}")
     for label, v, kind, _ in rows:
         print(f"  {label:50s} {v:7.1f}")
     for (t, cfg), v in sorted(pts.items()):
