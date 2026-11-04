@@ -41,6 +41,7 @@ import ttnn
 from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbedder
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
+from models.demos.gemma4.tt.decode_matmul import lm_head_out_block_w_config, lm_head_out_block_w_from_env
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
@@ -201,6 +202,32 @@ class Gemma4AssistantModel:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
+        # GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W (opt-in): fix out_block_w of the full-vocab lm_head, which otherwise runs
+        # on ttnn's automatic config (decode_matmul.lm_head_out_block_w_config). Single chip only: at TP > 1 the head
+        # is a vocab shard, a case this has not been measured on.
+        self._lm_head_out_block_w = lm_head_out_block_w_from_env("GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W")
+        if self._lm_head_out_block_w is not None and tp > 1:
+            raise ValueError(f"GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W supports a single chip only (tp={tp})")
+        if self._lm_head_out_block_w is not None and self.use_cme:
+            raise ValueError(
+                "GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W does not apply to the centroid masked embedding head"
+            )
+        self._lm_head_cfg = None
+
+    def _lm_head_configs(self, x):
+        """(program_config, compute_kernel_config) of the lm_head call: (None, None) = ttnn's automatic config."""
+        if self._lm_head_out_block_w is None:
+            return None, None
+        if self._lm_head_cfg is None:
+            self._lm_head_cfg = lm_head_out_block_w_config(
+                self.mesh_device,
+                k=int(self.lm_head.shape[-2]),
+                n=int(self.lm_head.shape[-1]),
+                out_block_w=self._lm_head_out_block_w,
+                x_dtype=x.dtype,
+                w_dtype=self.lm_head.dtype,
+            )
+        return self._lm_head_cfg
 
     def _raw_token_embed(self, token_tt):
         """Target token embedding of a single token id -> [1,1,1,backbone] TILE.
@@ -328,7 +355,8 @@ class Gemma4AssistantModel:
                 # Replicated weights, ~4096-wide output: no all-gather needed.
                 logits = self.masked_embedding.forward(normed)
             else:
-                logits = ttnn.linear(normed, self.lm_head)
+                pc, ckc = self._lm_head_configs(normed)
+                logits = ttnn.linear(normed, self.lm_head, program_config=pc, compute_kernel_config=ckc)
                 if gather_logits and self.mesh_config is not None and self.mesh_config.tp > 1:
                     logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)
 
