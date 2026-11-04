@@ -87,7 +87,8 @@ def pins(env):
     out = {}
     for entry in env.get("GEMMA4_L1_PIN", "").split(";"):
         if entry.strip():
-            head, _, pcn = entry.partition(":")
+            head, _, opts = entry.partition(":")
+            pcn = opts.split(":")[0]  # per_core_N, then options such as "pc", "y<row>", "s"
             name, _, layers = head.partition("@")
             out[name] = (layers or "all", int(pcn) if pcn else None)
     return out

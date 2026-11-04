@@ -35,6 +35,11 @@ keep its NIU0 in NOC2AXI mode, or those reads return its L1. GEMMA4_LMHEAD_L1_RE
 "noc1" (default) runs that DRISC's kernel on NoC1, so only its NIU1 goes to stream mode; "drop" leaves it out
 and the bank's other DRISC pushes all of its pages (exact, but the push no longer hides; record §9.2e).
 
+With the head entirely in DRAM (no GEMMA4_LMHEAD_L1_COLS), `register_pins` anchors the same reload on the lowest
+backbone pin below the ceiling instead (gemma4-12b record §9.5, stage 2); the other pins below it are extras, as
+above. The reload then runs before the whole-head lm_head, so the restored pins must not be consumed between the
+global SDPA and the lm_head (layer-3 weights): the identity check catches a violation.
+
 GEMMA4_LMHEAD_L1_RELOAD_CEIL (default 801,024, the captured global-SDPA ceiling) bounds the snapshot
 and the reload: everything from S up to it is reloaded. Every bracket asserts that its op's highest
 CB end, read from the op's program, does not exceed it.
@@ -62,7 +67,7 @@ WAIT_TIMEOUT = 1_000_000  # waiter polls (two NoC round trips each) before it gi
 PAGE = 2048
 KDIR = "research_codes/mm_profiling/kernels/"
 
-_st = None  # the registered head (one drafter model per process)
+_st = None  # the registered anchor: the head, or the lowest backbone pin (one drafter model per process)
 
 
 class _State:
@@ -95,10 +100,33 @@ def _page_program(kernel, dram, cores, l1_addr):
 
 def register(owner, attr, device):
     """Take over `owner.<attr>` (the pinned, width-sharded L1 head) and snapshot `[S, ceiling)`."""
-    global _st
     if not ENABLED:
         return
-    head = getattr(owner, attr)
+    _register(owner, getattr(owner, attr), [(owner, attr)], device)
+
+
+def register_pins(root, device):
+    """Head entirely in DRAM (record §9.5, stage 2): anchor the reload on the lowest L1-sharded tensor reachable from
+    `root` (the drafter model) that lies below the ceiling on the global SDPA's 8 x 4 block; the others there become
+    extras. Idle when there is none."""
+    if not ENABLED:
+        return
+    grid = device.compute_with_storage_grid_size()
+    block = {(x, y) for x in range(min(8, grid.x)) for y in range(min(4, grid.y))}
+    pins = _find_extras(root, None, block)
+    if not pins:
+        logger.info(f"[lm-head-reload] no pin below the ceiling {CEILING}: nothing to reload, knob idle")
+        return
+    anchor = pins[-1]  # lowest first address
+    if anchor["per_core"]:
+        raise ValueError(f"[lm-head-reload] the reload anchor {anchor['name']} must be a lockstep pin")
+    logger.info(f"[lm-head-reload] head in DRAM: anchoring the reload on the lowest pin {anchor['name']}")
+    _register(root, anchor["tensor"], anchor["refs"], device)
+
+
+def _register(root, head, refs, device):
+    """Snapshot `[S, ceiling)` of the anchor `head` (referenced by `refs`) on its shard cores; find the extras."""
+    global _st
     mc = head.memory_config()
     grid = mc.shard_spec.grid
     cores = [(c.x, c.y) for c in ttnn.corerange_to_cores(grid, row_wise=True)]
@@ -107,7 +135,7 @@ def register(owner, attr, device):
         logger.info(f"[lm-head-reload] head at {s_addr} >= ceiling {CEILING}: nothing to reload, knob idle")
         return
     st = _State()
-    st.owner, st.attr, st.device = owner, attr, device
+    st.anchor, st.device = {"tensor": head, "refs": refs}, device
     st.shape, st.dtype, st.layout, st.mc = head.shape, head.dtype, head.layout, mc
     st.S, st.cores, st.index = s_addr, cores, {c: i for i, c in enumerate(cores)}
     st.pages = -(-(CEILING - s_addr) // PAGE)
@@ -117,7 +145,7 @@ def register(owner, attr, device):
     # Reload core sets are snapped to two fixed sets so the trace sees a fixed set of programs: the
     # drafter global SDPA's 8x4 block (it also covers the split-logits concat on (0,0)), else all cores.
     st.small = [c for c in cores if c[0] < 8 and c[1] < 4]
-    st.extras = _find_extras(owner, head, set(st.small))
+    st.extras = _find_extras(root, head, set(st.small))
     st.snap = ttnn.allocate_tensor_on_device(
         ttnn.Shape([1, 1, len(cores) * st.pages, PAGE // 2]),
         ttnn.bfloat16,
@@ -155,7 +183,7 @@ def _one_core_program(kernel, core, compile_args, runtime_args, noc, cbs=()):
 
 
 def _drisc_trigger(cmd):
-    head = getattr(_st.owner, _st.attr)
+    head = _st.anchor["tensor"]
     prog = _one_core_program(
         "drisc_reload_trigger.cpp",
         _st.waiter,
@@ -167,7 +195,7 @@ def _drisc_trigger(cmd):
 
 
 def _drisc_wait():
-    head = getattr(_st.owner, _st.attr)
+    head = _st.anchor["tensor"]
     scratch = ttnn.CBDescriptor(
         total_size=32 * len(_st.drisc_xy),
         core_ranges=_crs([_st.waiter]),
@@ -390,7 +418,7 @@ class bracket:
             # The op's CBs may overlap bytes a DRISC is still writing: finish the push first.
             _drisc_wait()
             logger.warning(f"[lm-head-reload] bracket '{self.tag}' entered during a DRISC reload; waited for it")
-        getattr(_st.owner, _st.attr).deallocate(True)
+        _st.anchor["tensor"].deallocate(True)
         for e in _st.extras:
             e["tensor"].deallocate(True)
         if self.key not in _st.footprints:
@@ -441,7 +469,7 @@ class bracket:
                 f"[lm-head-reload] head re-allocated at {h.buffer_address()} after {self.tag}, expected {_st.S}: "
                 "something allocated L1 inside the bracket"
             )
-        setattr(_st.owner, _st.attr, h)
+        _set_refs(_st.anchor, h)
         _st.dirty.update(_st.footprints[self.key][0])
         if getattr(_st, "drisc", None) is not None and _st.in_drafter and self.tag == "global SDPA" and _st.dirty:
             # The drafter's last head-overwriting op before its lm_head: start the push now.
@@ -473,7 +501,7 @@ def reload():
     if not _st.dirty:
         return
     cores = _st.small if _st.dirty <= set(_st.small) else _st.cores
-    head = getattr(_st.owner, _st.attr)
+    head = _st.anchor["tensor"]
     ttnn.generic_op([_st.snap, head], _page_program("dram_reload_pages.cpp", _st.snap, cores, _st.S))
     if len(cores) not in _st.__dict__.setdefault("logged", set()):
         _st.logged.add(len(cores))

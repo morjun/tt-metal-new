@@ -75,6 +75,32 @@ uint32_t get_preferred_noc(
     return use_dedicated_noc ? 1 : noc;
 }
 
+// RESEARCH (gemma4-12b record §9.5, thin-K spread pin): with TT_MM1D_IN1_SPREAD set, a mcast_in0 matmul whose in1 is
+// L1 WIDTH_SHARDED on C > ceil(N / per_core_N) cores runs on all C of them. The weight's bytes are laid out by the
+// caller (models/demos/gemma4/tt/weight_placement.py, spread pins): the first q = N - (per_core_N - 1) * C cores hold
+// per_core_N real tiles, the others per_core_N - 1 real tiles and one pad tile. Every core computes per_core_N tiles;
+// the writer drops each of the other cores' pad tile, so the output stays N tiles wide. Returns C, or 0 when the knob
+// is unset or does not apply (the stock path is then unchanged).
+static uint32_t mcast_in0_in1_spread_cores(
+    bool in1_is_sharded, const MeshTensor& in1, uint32_t N, uint32_t per_core_N) {
+    if (std::getenv("TT_MM1D_IN1_SPREAD") == nullptr || !in1_is_sharded ||
+        in1.memory_config().buffer_type() != tt::tt_metal::BufferType::L1 || per_core_N < 2) {
+        return 0;
+    }
+    const uint32_t cores = in1.shard_spec()->grid.num_cores();
+    if (cores <= ((N - 1) / per_core_N) + 1) {
+        return 0;
+    }
+    TT_FATAL(
+        (per_core_N - 1) * cores < N && N <= per_core_N * cores,
+        "TT_MM1D_IN1_SPREAD: N={} tiles does not spread over {} cores at per_core_N {} / {}",
+        N,
+        cores,
+        per_core_N,
+        per_core_N - 1);
+    return cores;
+}
+
 MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_program_and_create_override_variables(
     tt_metal::Program& program,
     const ttnn::Tensor& a,
@@ -233,6 +259,9 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_mcast_in0_
     uint32_t num_blocks_x = ((N - 1) / per_core_N) + 1;
     uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
     uint32_t num_cores_with_work = num_blocks_total;
+    TT_FATAL(
+        mcast_in0_in1_spread_cores(in1_is_sharded, in1_tensor, N, per_core_N) == 0,
+        "TT_MM1D_IN1_SPREAD is implemented on the descriptor path only (create_program_mcast_in0_descriptor)");
 
     // mcast_in0 broadcasts a single M-block across all cores; only the start_core gets in0 sender
     // runtime args (with output_idx_y == 0), so M must fit within per_core_M.
@@ -3230,6 +3259,16 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
 
     uint32_t num_blocks_y = ((M - 1) / per_core_M) + 1;
     uint32_t num_blocks_x = ((N - 1) / per_core_N) + 1;
+    // TT_MM1D_IN1_SPREAD (see mcast_in0_in1_spread_cores): run on every in1 shard core; the cores from
+    // spread_full_cores on write per_core_N - 1 tiles.
+    const uint32_t spread_cores = mcast_in0_in1_spread_cores(in1_is_sharded, in1_tensor, N, per_core_N);
+    const uint32_t spread_full_cores = spread_cores ? N - (per_core_N - 1) * spread_cores : 0;
+    if (spread_cores) {
+        TT_FATAL(
+            !output_is_sharded && !bias_tensor.has_value() && !fused_op_signaler.has_value(),
+            "TT_MM1D_IN1_SPREAD needs an interleaved output, no bias and no fused op");
+        num_blocks_x = spread_cores;
+    }
     uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
     uint32_t num_cores_with_work = num_blocks_total;
 
@@ -3984,7 +4023,7 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
     ////////////////////////////////////////////////////////////////////////////
     // Parameters for last row, col, or block. mcast_in0 replicates M across all cores
     // (num_blocks_y == 1), so any M-direction padding lives entirely within a single h-block.
-    uint32_t last_per_core_N = N % per_core_N == 0 ? per_core_N : N % per_core_N;
+    uint32_t last_per_core_N = spread_cores ? per_core_N - 1 : (N % per_core_N == 0 ? per_core_N : N % per_core_N);
     uint32_t last_out_block_w = last_per_core_N % out_block_w == 0 ? out_block_w : last_per_core_N % out_block_w;
     uint32_t last_out_num_blocks_w = ((last_per_core_N - 1) / out_block_w) + 1;
     uint32_t last_block_num_nonzero_subblocks_w = ((last_out_block_w - 1) / out_subblock_w) + 1;
@@ -4017,6 +4056,12 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
         const auto& core = cores[i];
         uint32_t output_idx_x = i % num_blocks_x;
         uint32_t output_idx_y = i / num_blocks_x;
+        // Spread: the cores from spread_full_cores on write per_core_N - 1 tiles each (the "last block" args).
+        const bool short_block = output_idx_x == num_blocks_x - 1 || (spread_cores && i >= spread_full_cores);
+        const uint32_t out_start_tile_x =
+            spread_cores && i >= spread_full_cores
+                ? spread_full_cores * per_core_N + (i - spread_full_cores) * (per_core_N - 1)
+                : output_idx_x * per_core_N;
 
         if (in0_is_sharded) {
             std::vector<uint32_t> mm_in0_sender_args;
@@ -4098,11 +4143,10 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
                 // WRITER
                 // out tensor args
                 (std::uint32_t)out_tensor.address(),
-                ((std::uint32_t)output_idx_x * per_core_N) +
-                    (output_idx_y * per_core_M * N)  // out_tensor_start_tile_id
+                ((std::uint32_t)out_start_tile_x) + (output_idx_y * per_core_M * N)  // out_tensor_start_tile_id
             };
 
-            if (output_idx_x == num_blocks_x - 1) {
+            if (short_block) {
                 // padding args (READER)
                 mm_in1_sender_writer_args.push_back(last_out_block_w);
 
@@ -4136,7 +4180,7 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
             mm_in1_sender_writer_args.push_back(
                 bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id
             if (!output_is_sharded) {
-                if (output_idx_x == num_blocks_x - 1) {
+                if (short_block) {
                     mm_in1_sender_writer_args.push_back(last_out_num_blocks_w);
                 } else {
                     mm_in1_sender_writer_args.push_back(out_num_blocks_x);

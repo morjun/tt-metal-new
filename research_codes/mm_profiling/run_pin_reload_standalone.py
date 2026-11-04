@@ -81,13 +81,29 @@ def arm_spec(arm):
     in0_block_w for one BLK_GROUPS group (GEMMA4_MM_BLOCK_CAP_SHAPES). A pin suffix ending in "c" allocates that pin
     per core (GEMMA4_L1_PIN ":pc", needs "+hybrid"); "+resB<tiles>" reserves <tiles> head tiles per core, per-core,
     on the cores outside the 86-core prefix (GEMMA4_LMHEAD_L1_RESERVE_B, record §9.4 S2); "+sliceB<tiles>[top<rows>]" builds a real
-    head slice B there, or on grid rows 0 .. rows - 1 (GEMMA4_LMHEAD_L1_SLICE_B); a pin suffix "y<row>" starts that pin's prefix at grid row <row>. "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
+    head slice B there, or on grid rows 0 .. rows - 1 (GEMMA4_LMHEAD_L1_SLICE_B); a pin suffix "y<row>" starts that pin's prefix at grid row <row>; a pin suffix "s" spreads that pin over all 110 cores
+    (GEMMA4_L1_PIN ":s" + TT_MM1D_IN1_SPREAD, needs build_codex_current; record §9.5). "+nocswap" swaps the 1D-mcast matmuls' in0 / in1
     NoCs (TT_MM1D_MCAST_IN0_SWAP_NOCS; needs mcast1d_swap_nocs.patch built in). A trailing "+hybrid" opens the device in
     the HYBRID allocator mode (TT_METAL_ALLOCATOR_MODE_HYBRID, record §9.4); it is stripped before every other suffix.
     """
     if arm.endswith("+hybrid"):
         base, extra, width = arm_spec(arm[: -len("+hybrid")])
         return base, {**extra, "TT_METAL_ALLOCATOR_MODE_HYBRID": "1"}, width
+    if arm.endswith("+bbreload"):
+        # head entirely in DRAM: F0's DRISC reload (60 GB/s, 2-page chunks), anchored on the lowest backbone pin below
+        # the global-SDPA ceiling (lm_head_reload.register_pins; record §9.5 stage 2). Stripped right after "+hybrid"
+        base, extra, width = arm_spec(arm[: -len("+bbreload")])
+        return (
+            base,
+            {
+                **extra,
+                "GEMMA4_LMHEAD_L1_RELOAD": "1",
+                "GEMMA4_LMHEAD_L1_RELOAD_DRISC": "1",
+                "GEMMA4_LMHEAD_L1_RELOAD_DRISC_GBPS": "60",
+                "GEMMA4_LMHEAD_L1_RELOAD_DRISC_CHUNK": "2",
+            },
+            width,
+        )
     m = re.search(r"\+timeline(\d+)$", arm)
     if m:
         # per-core timeline markers in the 1D-mcast matmuls with Kt x Nt = 32 x 256 (up / gate_proj), marker-set mask
@@ -121,20 +137,22 @@ def arm_spec(arm):
     if "+pin" in arm:
         base, *pins = arm.split("+pin")
         base, extra, width = arm_spec(base)
-        spec, ring = [], False
+        spec, ring, spread = [], False, False
         for pin in pins:
-            m = re.fullmatch(r"([a-z_]+)(?:@([\d-]+))?(?:p(\d+))?(r)?(c)?(?:y(\d+))?", pin)
+            m = re.fullmatch(r"([a-z_]+)(?:@([\d-]+))?(?:p(\d+))?(r)?(c)?(?:y(\d+))?(s)?", pin)
             if not m:
                 raise SystemExit(f"unknown pin {pin!r} in {arm}")
-            name, layers, pcn, r, c, y = m.groups()
+            name, layers, pcn, r, c, y, s = m.groups()
             spec.append(
                 name
                 + (f"@{layers}" if layers else "")
                 + (f":{pcn}" if pcn else "")
                 + (":pc" if c else "")
                 + (f":y{y}" if y else "")
+                + (":s" if s else "")
             )
             ring |= bool(r)
+            spread |= bool(s)
         extra = {
             **extra,
             "GEMMA4_STANDALONE_PLACEMENT": "l1_sharded",
@@ -143,6 +161,8 @@ def arm_spec(arm):
         }
         if ring:
             extra.update({"GEMMA4_GATHER_IN0": "1", "GEMMA4_GATHER_DEBUG": "1"})
+        if spread:
+            extra["TT_MM1D_IN1_SPREAD"] = "1"
         return base, extra, width
     m = re.search(r"\+blk(fatk|wide)(\d+)$", arm)
     if m:

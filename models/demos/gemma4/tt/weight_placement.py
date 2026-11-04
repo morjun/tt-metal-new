@@ -76,10 +76,11 @@ def _parse_layer_spec(spec):
 
 def _parse_pin_spec(spec):
     """ "down_proj@0;gate_proj@0-3:3;up_proj@0:3:pc:y4" -> ((substring, layers, per_core_N or None, per_core,
-    origin row), ...).
+    origin row, spread), ...).
 
     ``:pc`` allocates the pin per core (HYBRID allocator mode only); ``:y<n>`` shards it on the row-major prefix of
-    the grid's rows n and below instead of from row 0 (gemma4-12b record §9.4)."""
+    the grid's rows n and below instead of from row 0 (gemma4-12b record §9.4); ``:s`` spreads it over every grid
+    core (see ``shard_l1_width``; record §9.5)."""
     out = []
     for entry in (spec or "").split(";"):
         entry = entry.strip()
@@ -87,11 +88,19 @@ def _parse_pin_spec(spec):
             continue
         head, *opts = entry.split(":")
         per_core = "pc" in opts
+        spread = "s" in opts
         origin = [int(o[1:]) for o in opts if o.startswith("y")]
-        pcn = [o for o in opts if o.strip() and o != "pc" and not o.startswith("y")]
+        pcn = [o for o in opts if o.strip() and o not in ("pc", "s") and not o.startswith("y")]
         sub, _, layers = head.partition("@")
         out.append(
-            (sub.strip(), _parse_layer_spec(layers), int(pcn[0]) if pcn else None, per_core, origin[0] if origin else 0)
+            (
+                sub.strip(),
+                _parse_layer_spec(layers),
+                int(pcn[0]) if pcn else None,
+                per_core,
+                origin[0] if origin else 0,
+                spread,
+            )
         )
     return tuple(out)
 
@@ -179,7 +188,8 @@ class WeightPlacement:
     #: ``down_proj@0;gate_proj@0:3;post_projection:2``. ``per_core_N`` shards the weight on
     #: the row-major prefix of ceil(Nt / per_core_N) cores of the full device grid instead
     #: of the tuner's grid (gemma4-12b record §9.2). A trailing ``:pc`` allocates that pin per core,
-    #: which needs the HYBRID allocator mode (record §9.4). Env: GEMMA4_L1_PIN.
+    #: which needs the HYBRID allocator mode (record §9.4); ``:s`` spreads it over every grid core (record §9.5).
+    #: Env: GEMMA4_L1_PIN.
     pins: tuple = ()
     #: Defer all sharding to an explicit post-load pass. Required for the TARGET,
     #: whose weights also serve prefill: a decode-shaped shard makes prefill's
@@ -204,6 +214,7 @@ class WeightPlacement:
         self._pcn = {}
         self._per_core = set()
         self._origin = {}
+        self._spread = set()
 
     @classmethod
     def from_env(cls, default_mode="dram", **kwargs):
@@ -254,9 +265,10 @@ class WeightPlacement:
     def _pin_for(self, name):
         """The first GEMMA4_L1_PIN entry matching this weight name, or None."""
         m = _LAYER_RE.search(name or "")
-        for sub, layers, pcn, per_core, origin in self.pins:
+        for pin in self.pins:
+            sub, layers = pin[0], pin[1]
             if sub in name and (not layers or (m is not None and int(m.group(1)) in layers)):
-                return sub, layers, pcn, per_core, origin
+                return pin
         return None
 
     def per_core_n(self, name):
@@ -270,6 +282,10 @@ class WeightPlacement:
     def origin_row(self, name):
         """First grid row of a pinned weight's shard prefix (GEMMA4_L1_PIN ``:y<n>``), 0 by default."""
         return self._origin.get(name, 0)
+
+    def spread(self, name):
+        """Whether a pinned weight is spread over every grid core (GEMMA4_L1_PIN ``:s``)."""
+        return name in self._spread
 
     def _layer_allowed(self, name):
         if not self.layers:
@@ -321,6 +337,8 @@ class WeightPlacement:
                 self._per_core.add(name)
             if pin[4]:
                 self._origin[name] = pin[4]
+            if pin[5]:
+                self._spread.add(name)
         elif self.only and not any(s in name for s in self.only):
             self.entries.append(_Entry(name, 0, False, "not in GEMMA4_L1_ONLY"))
             return ttnn.DRAM_MEMORY_CONFIG
@@ -420,7 +438,103 @@ def l1_core_addresses(tensor):
     return {(c.x, c.y): addr for c in cores}
 
 
-def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False, origin_row=0):
+def spread_tiles(nt, cores, per_core_n):
+    """(first tile, real tiles) per core of a spread pin, row-major: the first ``nt - (per_core_n - 1) * cores``
+    cores hold ``per_core_n`` tiles, the others ``per_core_n - 1`` (gemma4-12b record §9.5)."""
+    full = nt - (per_core_n - 1) * cores
+    if per_core_n < 2 or not 0 < full < cores:
+        raise ValueError(f"spread pin: {nt} tiles do not spread over {cores} cores at {per_core_n} / {per_core_n - 1}")
+    out, t = [], 0
+    for i in range(cores):
+        r = per_core_n if i < full else per_core_n - 1
+        out.append((t, r))
+        t += r
+    return out
+
+
+def _page_copy_program(kernel, dram, cores, pages, l1_addr):
+    """One reader per core copying its ``pages`` 2 KiB pages between ``l1_addr`` and rows [i * pages, ...) of the
+    ROW_MAJOR DRAM tensor ``dram`` (the lm_head reload's snapshot / reload kernels)."""
+    from models.demos.gemma4.tt.lm_head_reload import KDIR, PAGE
+
+    rt = ttnn.RuntimeArgs()
+    for i, c in enumerate(cores):
+        rt[c.x][c.y] = [dram.buffer_address(), i * pages, pages, l1_addr]
+    k = ttnn.KernelDescriptor(
+        kernel_source=KDIR + kernel,
+        source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+        core_ranges=ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cores]),
+        compile_time_args=[PAGE] + list(ttnn.TensorAccessorArgs(dram).get_compile_time_args()),
+        runtime_args=rt,
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    return ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[])
+
+
+def _spread_l1_width(tensor, mesh_device, k, n, per_core_n):
+    """RESEARCH (gemma4-12b record §9.5): a thin-K weight width-sharded at ``per_core_n`` tiles per core on EVERY grid
+    core, for the 1D-mcast factory's TT_MM1D_IN1_SPREAD mode. Core i's shard holds its real tiles
+    (``spread_tiles``) followed by zero pad tiles; the tensor keeps its logical [.., K, N] shape, so the matmul's
+    output is N wide (the factory's writer drops the pad tiles). The bytes are staged through a padded tensor on the
+    same shard spec, because ttnn would place the logical columns on the first ceil(Nt / per_core_n) cores only."""
+    import torch
+
+    from models.demos.gemma4.tt.lm_head_reload import PAGE
+
+    T = ttnn.TILE_SIZE
+    if os.getenv("TT_MM1D_IN1_SPREAD") is None:
+        raise RuntimeError("a spread pin needs TT_MM1D_IN1_SPREAD=1, or the stock matmul reads its shards wrong")
+    if mesh_device.get_num_devices() != 1 or tensor.dtype != ttnn.bfloat16:
+        raise ValueError("spread pins are single-device bf16 only")
+    grid_size = mesh_device.compute_with_storage_grid_size()
+    cores = grid_size.x * grid_size.y
+    layout = spread_tiles(n // T, cores, per_core_n)
+    lead = list(tensor.shape)[:-2]
+    host = ttnn.to_torch(ttnn.get_device_tensors(tensor)[0]).reshape(k, n)
+    w = per_core_n * T
+    padded = torch.zeros(k, cores * w, dtype=host.dtype)
+    for i, (t, r) in enumerate(layout):
+        padded[:, i * w : i * w + r * T] = host[:, t * T : (t + r) * T]
+    grid = prefix_core_range_set(cores, grid_size.x)
+    mc = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(grid, [k, w], ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    core_list = ttnn.corerange_to_cores(grid, row_wise=True)
+    pages = (k // T) * per_core_n * ttnn.TILE_SIZE * ttnn.TILE_SIZE * 2 // PAGE
+    stage = ttnn.from_torch(
+        padded.reshape(lead + [k, cores * w]),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=mesh_device,
+        memory_config=mc,
+    )
+    snap = ttnn.allocate_tensor_on_device(
+        ttnn.Shape([1, 1, cores * pages, PAGE // 2]),
+        ttnn.bfloat16,
+        ttnn.ROW_MAJOR_LAYOUT,
+        mesh_device,
+        ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.generic_op(
+        [stage, snap], _page_copy_program("dram_snapshot_pages.cpp", snap, core_list, pages, stage.buffer_address())
+    )
+    stage.deallocate(True)
+    moved = ttnn.allocate_tensor_on_device(tensor.shape, ttnn.bfloat16, ttnn.TILE_LAYOUT, mesh_device, mc)
+    ttnn.generic_op(
+        [snap, moved], _page_copy_program("dram_reload_pages.cpp", snap, core_list, pages, moved.buffer_address())
+    )
+    snap.deallocate(True)
+    full = sum(r == per_core_n for _, r in layout)
+    logger.info(
+        f"[placement] spread pin {list(tensor.shape)} at {moved.buffer_address()} on {cores} cores: "
+        f"{full} x {per_core_n} + {cores - full} x {per_core_n - 1} real tiles"
+    )
+    return moved
+
+
+def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False, origin_row=0, spread=False):
     """Reshard a loaded weight to L1 WIDTH_SHARDED on the matmul's compute grid.
 
     Each core ends up holding exactly the N-slice it multiplies, which is what
@@ -452,6 +566,12 @@ def shard_l1_width(tensor, mesh_device, per_core_n=None, per_core=False, origin_
         return None
     k, n = int(local[-2]), int(local[-1])
 
+    if spread:
+        if per_core_n is None or per_core or origin_row:
+            raise ValueError("a spread pin needs per_core_N, LOCKSTEP and origin row 0 (GEMMA4_L1_PIN <name>:<n>:s)")
+        if k % ttnn.TILE_SIZE or n % ttnn.TILE_SIZE:
+            return None
+        return _spread_l1_width(tensor, mesh_device, k, n, per_core_n)
     if per_core_n is not None:
         # GEMMA4_L1_PIN per_core_N: the row-major prefix of the full device grid; the last
         # shard may be partial. DecodeMatmulTuner reads the grid back from the shard spec.
@@ -601,6 +721,7 @@ def _place_as_tensor(
                 per_core_n=placement.per_core_n(name),
                 per_core=placement.per_core(name),
                 origin_row=placement.origin_row(name),
+                spread=placement.spread(name),
             )
             if moved is None:
                 # Normal for norms / non-matmul weights: give the budget back and

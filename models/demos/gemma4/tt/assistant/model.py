@@ -341,6 +341,10 @@ class Gemma4AssistantModel:
             if self.lm_head is None:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
             self._split_lm_head_to_l1(mesh_device)
+            if self.lm_head_l1 is None:
+                # Research knob GEMMA4_LMHEAD_L1_RELOAD with the head entirely in DRAM (record §9.5): anchor the
+                # reload on the backbone pins the global SDPA overwrites. No-op without the knob or such a pin.
+                lm_head_reload.register_pins(self, mesh_device)
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
 
@@ -661,6 +665,7 @@ class Gemma4AssistantModel:
                     # Measured (record §8): with an L1 output, ttnn's automatic matmul config computes different
                     # logits; the explicit configs (GEMMA4_LMHEAD_DRAFT_OBW) are bit-identical to DRAM.
                     raise ValueError("GEMMA4_LMHEAD_LOGITS_L1 on the whole head needs GEMMA4_LMHEAD_DRAFT_OBW")
+                lm_head_reload.reload()  # no-op unless GEMMA4_LMHEAD_L1_RELOAD (pin-anchored, record §9.5)
                 logits = ttnn.linear(
                     normed,
                     self.lm_head,
