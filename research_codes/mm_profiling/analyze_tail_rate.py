@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """G_read of gemma4-12b record §9.2b (M2): what the +16.8 µs per draft between F0's and H1's DRAM reads is made of.
 
-1. Decomposition [derived], from analyze_m12.py's m12.json (sampled arms; per-draft windows R, NIU bytes per call B):
-   G_read = R_tail,H1 - R_tail,F0 - R_up,F0 splits, at F0's tail rate r = B_tail,F0 / R_tail,F0, into
-     up L0's bytes at the tail rate instead of up L0's own:  B_up / r - R_up
-     H1's extra bytes beyond F0 tail + up L0:               (B_tail,H1 - B_tail,F0 - B_up) / r
-     H1's tail slower than F0's per byte:                   R_tail,H1 - B_tail,H1 / r
+1. Decomposition [derived], from analyze_m12.py's m12.json (sampled arms; per-draft windows R, NIU bytes per call B).
+   DRAM reads: F0 reads B_up in up L0 (R_up) and B_tail,F0 in its tail (R_tail,F0); H1 (up L0 pinned) reads
+   B_tail,H1 in its tail (R_tail,H1). G_read = R_tail,H1 - (R_tail,F0 + R_up). Reference: H1's bytes at F0's tail
+   rate r = B_tail,F0 / R_tail,F0, i.e. B_tail,H1 / r. Then
+     F0's up L0 bytes, read slower than its tail reads:    B_up / r - R_up
+     H1 reads more bytes than F0 in total:                 (B_tail,H1 - B_tail,F0 - B_up) / r
+     (sum of the two = H1 at F0's tail rate minus F0)
+     H1's tail slower per byte than F0's tail:             R_tail,H1 - B_tail,H1 / r
 2. Per-core NIU delivery of the tail [measured], every tail call of the +niusample cells: cores, MB per core, window
    (earliest first sample -> latest last sample), when 90% / 99% of the call's bytes had arrived, the rate up to 90%,
    the time after 90%, the spread of the cores' last samples, the core that ends the call.
@@ -41,15 +44,16 @@ def decomposition(root):
     BF, BU, BH = F["B_tail_per_call"], F["B_up_per_call"], H["B_tail_per_call"]
     r = BF / RF  # bytes per µs of a per-draft window, per call
     parts = {
-        "up L0's bytes at F0's tail rate instead of up L0's": BU / r - RU,
-        "H1's bytes beyond F0 tail + up L0": (BH - BF - BU) / r,
-        "H1's tail slower per byte than F0's": RH - BH / r,
+        "F0 reads up L0's bytes in up L0, slower than its tail would": BU / r - RU,
+        "H1 reads more bytes than F0 (up L0 + tail)": (BH - BF - BU) / r,
+        "H1's tail slower per byte than F0's tail": RH - BH / r,
     }
     print("1. G_read decomposition, µs per draft")
     print(f"   windows per draft: F0 tail {RF:.1f}, F0 up L0 {RU:.1f}, H1 tail {RH:.1f}; G_read {RH - RF - RU:+.1f}")
     print(f"   MB per call: F0 tail {BF / 1e6:.3f}, up L0 {BU / 1e6:.3f}, H1 tail {BH / 1e6:.3f}")
     gb = lambda b, R: b / (R / 3) / 1e3
     print(f"   GB/s: F0 tail {gb(BF, RF):.1f}, H1 tail {gb(BH, RH):.1f}, up L0 {gb(BU, RU):.1f}")
+    print(f"   DRAM read time: F0 {RF + RU:.1f}, H1 {RH:.1f}, H1's bytes at F0's tail rate {BH / r:.1f}")
     for k, v in parts.items():
         print(f"   {k}: {v:+.1f}")
     print(f"   sum {sum(parts.values()):+.1f}")
