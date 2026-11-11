@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""fig33 of gemma4-12b record §9.2b ("The output write"): one call of up_proj L0, per core, weight in DRAM (c) vs in L1 (d).
+"""fig33 of gemma4-12b record §9.2b ("The output write"): up_proj L0 per core, weight in DRAM (c) vs in L1 (d).
 
-Left: three receiver cores of one call (the call of median duration in the cell), every K-block's weight read (c),
-activation arrival, compute (inputs available -> packed) and the output write (last pack -> writes complete).
-c: the cores with the earliest, median and latest last weight block; d: the earliest, median and latest to finish.
-The core with 1 output tile (ONE_TILE) is not picked. Right: every core of the same call, sorted by its last pack: the last pack (marker: which input it waited for last)
-and its write (line to writes complete). Prints the selected call and cores.
+Same data as fig34 (plot_write_heatmap.py): every call of every marked M3 / M3b cell of the arm (16 cells, 240 calls).
+Every time is the per-core median over those calls of (marker - the call's first core start). The write is the median
+of (writes complete - last pack), i.e. fig34's value, drawn from the median last pack. The activation arrival and
+which input a core waited for last come from the cells that mark the arrival (masks 3 and 33; 4 cells, 60 calls).
 
-    python research_codes/mm_profiling/plot_pack_spread.py generated/lmhead_l1_profile/m3_1103/04_* \
-        generated/lmhead_l1_profile/m3_1103/05_* \
+Left: three receiver cores, every K-block's weight read (c), activation arrival, compute (inputs available -> packed)
+and the output write. c: the cores with the earliest, median and latest last weight block; d: the earliest, median
+and latest to finish. The core with 1 output tile (ONE_TILE) is not picked. Right: every core, sorted by its last
+pack: the last pack (marker: which input it waited for last in most calls) and its write. Dashed line: the median
+call end. Prints the selected cores.
+
+    python research_codes/mm_profiling/plot_pack_spread.py generated/lmhead_l1_profile \
         --fig ../lab-meeting-notes/documents/gemma4-specdec/gemma4-12b/figures/fig33_pack_spread
 """
 
@@ -16,7 +20,10 @@ import argparse
 import statistics
 from pathlib import Path
 
+from collections import defaultdict
+
 from analyze_output_segments import calls
+from plot_write_heatmap import marked_cells
 
 INK, INK2, GRID = "#1f2328", "#59636e", "#e6e8eb"
 WEIGHT, COMPUTE, OUTPUT, ACT = "#5d6b7e", "#e69f00", "#0072b2", "#009e73"
@@ -25,16 +32,29 @@ NB = 4
 ONE_TILE = (13, 9)
 
 
-def complete(marks):
-    return {c: v for c, v in marks.items() if (0x17, 0) in v and all((0x34, b) in v for b in range(NB))}
-
-
-def median_call(cell):
-    cs = [complete(m) for m in calls(cell)]
-    cs = [m for m in cs if len(m) >= 80]
-    dur = [max(v[(0x17, 0)] for v in m.values()) - min(v[(0x10, 0)] for v in m.values()) for m in cs]
-    i = sorted(range(len(cs)), key=lambda i: dur[i])[len(cs) // 2]
-    return cs[i], dur[i], len(cs)
+def aggregate(root, l1):
+    """Per core: median over all calls of each marker's time from the call start; write; share of calls it waited
+    last for the activation. Also the median call end and the number of calls."""
+    t, wr, gate, ends = defaultdict(lambda: defaultdict(list)), defaultdict(list), defaultdict(list), []
+    for cell in marked_cells(root, l1):
+        for m in calls(cell):
+            ok = {c: v for c, v in m.items() if (0x17, 0) in v and all((0x34, b) in v for b in range(NB))}
+            if len(ok) < 80:
+                continue
+            t0 = min(v[(0x10, 0)] for v in ok.values())
+            ends.append(max(v[(0x17, 0)] for v in ok.values()) - t0)
+            for c, v in ok.items():
+                for k, x in v.items():
+                    t[c][k].append(x - t0)
+                wr[c].append(v[(0x17, 0)] - v[(0x34, NB - 1)])
+                if (0x29, NB - 1) in v:
+                    gate[c].append(l1 or v[(0x29, NB - 1)] > v[(0x13, NB - 1)])
+    med = {c: {k: statistics.median(x) for k, x in v.items()} for c, v in t.items()}
+    for c in med:
+        med[c]["write"] = statistics.median(wr[c])
+        med[c]["end"] = med[c][(0x34, NB - 1)] + med[c]["write"]
+        med[c]["gate"] = statistics.mean(gate[c]) if gate[c] else None
+    return med, statistics.median(ends), len(ends)
 
 
 def main():
@@ -44,25 +64,22 @@ def main():
     import matplotlib.pyplot as plt
 
     p = argparse.ArgumentParser()
-    p.add_argument("c_cell", type=Path)
-    p.add_argument("d_cell", type=Path)
+    p.add_argument("root", type=Path)
     p.add_argument("--fig", required=True)
     a = p.parse_args()
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8.2), gridspec_kw={"width_ratios": [1.55, 1], "height_ratios": [1, 1]})
-    for row, (cell, l1) in enumerate(((a.c_cell, False), (a.d_cell, True))):
-        m, dur, n = median_call(cell)
-        t0 = min(v[(0x10, 0)] for v in m.values())
-        rel = {c: {k: t - t0 for k, t in v.items()} for c, v in m.items()}
+    for row, l1 in enumerate((False, True)):
+        rel, end, n = aggregate(a.root, l1)
         recv = {c: v for c, v in rel.items() if (0x29, NB - 1) in v}
         three = [c for c in recv if c != ONE_TILE]
         act_last = statistics.median(v[(0x29, NB - 1)] for v in recv.values())
-        key = (lambda c: recv[c][(0x17, 0)]) if l1 else (lambda c: recv[c][(0x13, NB - 1)])
+        key = (lambda c: recv[c]["end"]) if l1 else (lambda c: recv[c][(0x13, NB - 1)])
         order = sorted(three, key=key)
         pick = [("slowest", order[-1]), ("median", order[len(order) // 2]), ("fastest", order[0])]
-        end = max(v[(0x17, 0)] for v in rel.values())
         print(
-            f"{'d' if l1 else 'c'}: {cell.name[:2]}, median of {n} calls, {dur:.2f} µs; cores {[(k, c) for k, c in pick]}"
+            f"{'d' if l1 else 'c'}: medians over {n} calls, median call end {end:.2f} µs; "
+            f"cores {[(k, c, round(recv[c]['write'], 2)) for k, c in pick]}"
         )
 
         ax = axes[row][0]
@@ -80,7 +97,7 @@ def main():
                 s, e = v[(0x32, b)], v[(0x34, b)]
                 ax.broken_barh([(s, e - s)], (y - 0.3, 0.26), color=COMPUTE, edgecolor="white", lw=0.6)
                 ax.plot([v[(0x29, b)]] * 2, [y - 0.36, y + 0.04], color=ACT, lw=2)
-            s, e = v[(0x34, NB - 1)], v[(0x17, 0)]
+            s, e = v[(0x34, NB - 1)], v["end"]
             ax.broken_barh([(s, e - s)], (y - 0.3, 0.26), color=OUTPUT)
             ax.text(e + 0.15, y - 0.17, f"write {e - s:.2f}", va="center", fontsize=8, color=INK)
         ax.axvline(act_last, color=ACT, ls=":", lw=1.2)
@@ -102,15 +119,15 @@ def main():
         ax.set_title(
             "weight read from DRAM" if not l1 else "weight already in SRAM", loc="left", fontsize=10.5, color=INK
         )
-        ax.set_xlabel("µs from the matmul's start (one call)", fontsize=9.5, color=INK2)
+        ax.set_xlabel(f"µs from the matmul's start (median over {n} calls)", fontsize=9.5, color=INK2)
 
         bx = axes[row][1]
         allc = sorted(rel, key=lambda c: rel[c][(0x34, NB - 1)])
         for y, c in enumerate(allc):
             v = rel[c]
-            p_, e_ = v[(0x34, NB - 1)], v[(0x17, 0)]
+            p_, e_ = v[(0x34, NB - 1)], v["end"]
             bx.plot([p_, e_], [y, y], color=OUTPUT, lw=1.6, solid_capstyle="butt")
-            act_bound = (0x29, NB - 1) in v and (l1 or v[(0x29, NB - 1)] > v[(0x13, NB - 1)])
+            act_bound = v["gate"] is not None and v["gate"] > 0.5
             if (0x29, NB - 1) not in v:
                 bx.plot(p_, y, marker="D", ms=4, color=INK, ls="none")
             elif c == ONE_TILE:
@@ -125,9 +142,9 @@ def main():
         bx.set_yticks([])
         bx.set_ylabel(f"all {len(allc)} cores, sorted by last pack", fontsize=9, color=INK2)
         bx.set_xlabel("µs from the matmul's start", fontsize=9.5, color=INK2)
-        nA = sum(1 for c in recv if l1 or recv[c][(0x29, NB - 1)] > recv[c][(0x13, NB - 1)])
+        nA = sum(1 for c in recv if recv[c]["gate"] > 0.5)
         bx.set_title(
-            f"{nA} cores waited last for the activation, {len(recv) - nA} for their own weight",
+            f"{nA} cores usually waited last for the activation, {len(recv) - nA} for their own weight",
             loc="left",
             fontsize=9.5,
             color=INK,
