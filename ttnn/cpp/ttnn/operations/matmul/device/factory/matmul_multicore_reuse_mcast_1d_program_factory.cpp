@@ -6,6 +6,7 @@
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <utility>
@@ -3600,6 +3601,14 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
 
     if (in1_is_sharded) {
         mm_kernel_in1_sender_writer_defines["IN1_SHARDED"] = "1";
+    }
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD 5.5.12 part 9, 9.2h): per-core static VC of the in1 reader's read
+    // requests on the plain interleaved in1 path (MM_IN1_VC_MODE in the metal2 in1 reader). Off unless the env var
+    // is set; not part of the program hash.
+    if (const char* vc_mode = std::getenv("TT_MM1D_IN1_VC_MODE");
+        vc_mode != nullptr && !in1_is_sharded &&
+        !mm_kernel_in1_sender_writer_defines.contains("ENABLE_PREFETCHER_PIPE")) {
+        mm_kernel_in1_sender_writer_defines["MM_IN1_VC_MODE"] = vc_mode;
     }
 
     if (bias_is_sharded) {

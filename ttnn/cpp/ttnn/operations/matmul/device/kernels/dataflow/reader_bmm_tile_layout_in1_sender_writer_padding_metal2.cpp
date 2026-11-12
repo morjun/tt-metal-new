@@ -284,6 +284,35 @@ void kernel_main() {
     dfb_in1.push_back(in1_block_num_tiles * num_blocks_inner_dim);
 #elif !defined(ENABLE_GLOBAL_CB)
     [[maybe_unused]] const auto s1 = TensorAccessor(tensor::in1);
+    // RESEARCH (gemma4-12b MEASUREMENT_RECORD 5.5.12 part 9, 9.2h): static VC for this RISC's read requests.
+    // DM_DEDICATED_NOC never rewrites NOC_CTRL on the read path, so it is set once here and restored to the
+    // firmware's VC 1 at exit. Set by the factory from TT_MM1D_IN1_VC_MODE. 0 = untouched; 1 = logical y & 3;
+    // 2 = logical x & 3; 3 = (x + y) & 3. Values >= 16: kind = mode >> 4, k = mode & 15; kind 1 = y mod k,
+    // 2 = x mod k, 3 = (x + y) mod k, 4 = (bank of the core's first in1 column) mod k, 5 = fixed VC k. Unicast VCs 0-3.
+#ifndef MM_IN1_VC_MODE
+#define MM_IN1_VC_MODE 0
+#endif
+#if MM_IN1_VC_MODE != 0
+#if MM_IN1_VC_MODE < 16
+    const uint32_t in1_rd_vc = MM_IN1_VC_MODE == 1   ? (get_absolute_logical_y() & 0x3u)
+                               : MM_IN1_VC_MODE == 2 ? (get_absolute_logical_x() & 0x3u)
+                                                     : ((get_absolute_logical_x() + get_absolute_logical_y()) & 0x3u);
+#else
+    constexpr uint32_t vc_kind = MM_IN1_VC_MODE >> 4;
+    constexpr uint32_t vc_k = MM_IN1_VC_MODE & 0xf;
+    static_assert(vc_kind >= 1 && vc_kind <= 5 && (vc_kind == 5 ? vc_k <= 3 : (vc_k >= 1 && vc_k <= 4)));
+    const uint32_t in1_rd_vc = vc_kind == 1   ? get_absolute_logical_y() % vc_k
+                               : vc_kind == 2 ? get_absolute_logical_x() % vc_k
+                               : vc_kind == 3 ? (get_absolute_logical_x() + get_absolute_logical_y()) % vc_k
+                               : vc_kind == 4 ? (in1_tensor_start_tile_id % 8) % vc_k
+                                              : vc_k;
+#endif
+    NOC_CMD_BUF_WRITE_REG(
+        noc_index,
+        NCRISC_RD_CMD_BUF,
+        NOC_CTRL,
+        NOC_CMD_CPY | NOC_CMD_RD | NOC_CMD_RESP_MARKED | NOC_CMD_VC_STATIC | NOC_CMD_STATIC_VC(in1_rd_vc));
+#endif
     // The DRAM-sharded paths below read in1 by bank (BankView(s1)) rather than paging through the accessor.
 #endif  // ENABLE_PREFETCHER_PIPE / IN1_SHARDED / ENABLE_GLOBAL_CB
 
@@ -777,7 +806,10 @@ void kernel_main() {
     noc.async_atomic_barrier();
     noc.async_write_barrier();
 
-#ifdef IN1_DRAM_WIDTH_SHARDED
+#if defined(MM_IN1_VC_MODE) && MM_IN1_VC_MODE != 0
+    noc.async_read_barrier();
+#endif
+#if defined(IN1_DRAM_WIDTH_SHARDED) || (defined(MM_IN1_VC_MODE) && MM_IN1_VC_MODE != 0)
     // Restore only NCRISC read_cmd_buf NOC_CTRL VC to firmware default; a full set_async_read_state
     // would also clobber NOC_TARG_ADDR_* / NOC_AT_LEN_BE sticky regs that the next kernel's async_read_*_with_state fast paths read.
     const uint32_t noc_rd_cmd_field =
