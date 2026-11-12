@@ -207,7 +207,7 @@ def apply_per_head_norm(tensor, weight, eps, with_scale=True, memory_config=None
     return ttnn.reshape(normed, orig_shape)
 
 
-def apply_rope(tensor, cos_cache, sin_cache, token_index=None, memory_config=None):
+def apply_rope(tensor, cos_cache, sin_cache, token_index=None, memory_config=None, reload_bracket_tag=None):
     """
     Apply HF-style rotary position embedding.
 
@@ -228,7 +228,17 @@ def apply_rope(tensor, cos_cache, sin_cache, token_index=None, memory_config=Non
     tt_transformers _hf_rope_decode pattern.
     """
     orig_shape = tensor.shape
-    result = ttnn.experimental.rotary_embedding(tensor, cos_cache, sin_cache, token_index, memory_config=memory_config)
+    if reload_bracket_tag is None:
+        result = ttnn.experimental.rotary_embedding(
+            tensor, cos_cache, sin_cache, token_index, memory_config=memory_config
+        )
+    else:  # research knob GEMMA4_LMHEAD_L1_RELOAD_ROPE: free the drafter's pinned lm_head slice around this op
+        from models.demos.gemma4.tt import lm_head_reload
+
+        with lm_head_reload.bracket(reload_bracket_tag, tensor, cos_cache, sin_cache):
+            result = ttnn.experimental.rotary_embedding(
+                tensor, cos_cache, sin_cache, token_index, memory_config=memory_config
+            )
 
     # In decode mode (token_index provided), dim 2 gets padded to 32.
     # Reshape to indicate logical vs padded size, then slice back.

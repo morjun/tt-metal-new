@@ -25,6 +25,7 @@ from models.demos.gemma4.custom_ops.paged_update_rows import PagedUpdateRows
 from models.demos.gemma4.custom_ops.paged_update_rows.op import ENV as PACKED_KV_WRITE_OP_ENV
 from models.demos.gemma4.custom_ops.paged_update_rows.op import enabled as packed_kv_write_op_enabled
 from models.demos.gemma4.custom_ops.qkv_norm_rope import QkvNormRope
+from models.demos.gemma4.tt import lm_head_reload
 from models.demos.gemma4.tt.compute_config import sdpa_fp32_dest_acc_en, sdpa_math_fidelity
 from models.demos.gemma4.tt.mesh_orientation import decode_flag
 
@@ -426,9 +427,11 @@ def decode_forward(
             else:
                 cos_b, sin_b = base
 
+        rope_tag = "global rope" if lm_head_reload.active() and lm_head_reload.ROPE and config.head_dim >= 512 else None
+
         def _rope(t):
             if batch == 1 and not peruser_at_b1:
-                return apply_rope(t, cos_pos, sin_pos, token_index=0)
+                return apply_rope(t, cos_pos, sin_pos, token_index=0, reload_bracket_tag=rope_tag)
             return apply_rope_decode_peruser(t, cos_b, sin_b, prepared=rope_prepared)
 
         # Rotate Q (and K, unless this is a KV-shared layer) with the shared
@@ -555,10 +558,12 @@ def decode_forward(
             else:
                 ttnn.experimental.paged_update_cache(k_cache, tt_k, update_idxs_tensor=cache_pos)
                 ttnn.experimental.paged_update_cache(v_cache, tt_v, update_idxs_tensor=cache_pos)
-            if fused_qkv:
-                # the fused op's k / v shards are dead once written: free their L1 before SDPA
-                tt_k.deallocate(True)
-                tt_v.deallocate(True)
+            # The height-sharded k / v staging shards are dead once written to the cache: free their L1 before SDPA
+            # (the fused op's outputs, and the plain path's resharded copies alike). Left alive, they sit under any
+            # persistent L1 buffer allocated before them (the drafter's pinned lm_head slice), inside the global
+            # SDPA's static buffer range.
+            tt_k.deallocate(True)
+            tt_v.deallocate(True)
     else:
         k_cache = tt_k
         v_cache = tt_v
@@ -630,6 +635,12 @@ def decode_forward(
             )
         else:
             _splitfree_refused(splitfree_reason)
+    # Research knob GEMMA4_LMHEAD_L1_RELOAD (off by default): free the drafter's pinned lm_head slice around a
+    # global SDPA, whose circular buffers reach into it (tt/lm_head_reload.py).
+    reload_bracket = None
+    if tt_sdpa is None and lm_head_reload.active() and config.head_dim >= 512:
+        reload_bracket = lm_head_reload.bracket("global SDPA", tt_q, k_cache)
+        reload_bracket.__enter__()
     if tt_sdpa is not None:
         pass  # the split-independent op served the call
     elif page_table is not None:
@@ -664,6 +675,8 @@ def decode_forward(
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
         )
+    if reload_bracket is not None:
+        reload_bracket.__exit__(None, None, None)
     tt_q.deallocate(True)
 
     # 7. Concat heads + output projection + allreduce

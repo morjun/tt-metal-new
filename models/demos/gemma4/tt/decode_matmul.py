@@ -21,6 +21,7 @@ Per-site opt-in flags (all default off): ``GEMMA4_MLP_DECODE_1D`` (shared MLP ga
 ``GEMMA4_ATTN_DECODE_1D`` (wqkv / o_proj), ``GEMMA4_ROUTER_DECODE_1D`` (router projection).
 """
 
+import contextlib
 import math
 import os
 
@@ -30,10 +31,26 @@ from models.demos.gemma4.tt.mesh_orientation import decode_flag
 TILE = ttnn.TILE_SIZE
 
 
+_scoped_on = set()
+
+
+@contextlib.contextmanager
+def flags_on(*names):
+    """Turn decode switches on for the modules built inside the block, whatever the env and the build profile say.
+    The switches are read at construction, so this scopes them to one model (the assistant, see
+    ``GEMMA4_ASSISTANT_DECODE_1D``) without touching the others built in the same process."""
+    added = set(names) - _scoped_on
+    _scoped_on.update(added)
+    try:
+        yield
+    finally:
+        _scoped_on.difference_update(added)
+
+
 def flag(name: str) -> bool:
-    """A decode fusion switch: the env var when set, else the build profile's default (on for the 4-chip Blackhole
-    MoE build, off elsewhere; tt/mesh_orientation.py)."""
-    return decode_flag(name) == "1"
+    """A decode fusion switch: on inside a ``flags_on`` block naming it, else the env var when set, else the build
+    profile's default (on for the 4-chip Blackhole MoE build, off elsewhere; tt/mesh_orientation.py)."""
+    return name in _scoped_on or decode_flag(name) == "1"
 
 
 def is_decode_rows(x) -> bool:
@@ -206,7 +223,7 @@ def pipeline_row_for(mesh_device, hidden_size, op: str, tp: int):
     return dram_sharded_pipeline_row(hidden_size, op, tp, (grid.x, grid.y), is_blackhole())
 
 
-def lm_head_out_block_w_config(mesh_device, k: int, n: int, out_block_w: int, x_dtype, w_dtype):
+def lm_head_out_block_w_config(mesh_device, k: int, n: int, out_block_w: int, x_dtype, w_dtype, per_core_n=None):
     """Explicit 1D-mcast config for a full-vocab decode lm_head that fixes only ``out_block_w`` (opt-in).
 
     At tp=1 the lm_head (262144 columns) runs on ttnn's automatic config, which sizes ``out_block_w`` from the free
@@ -219,10 +236,17 @@ def lm_head_out_block_w_config(mesh_device, k: int, n: int, out_block_w: int, x_
 
     Returns ``(program_config, compute_kernel_config)``; the compute config is None where ttnn's default already
     matches the automatic path (both inputs block-float, or both fp32).
+
+    ``per_core_n`` (N tiles per core) overrides the automatic value: a larger one runs the head on fewer cores
+    (``ceil(N tiles / per_core_n)``). Each output tile keeps its K order, so the logits do not change.
     """
     grid = mesh_device.compute_with_storage_grid_size()
     cores = grid.x * grid.y
-    per_core_n = math.ceil(math.ceil(n / cores) / TILE)
+    min_per_core_n = math.ceil(math.ceil(n / cores) / TILE)
+    if per_core_n is None:
+        per_core_n = min_per_core_n
+    elif per_core_n < min_per_core_n:
+        raise ValueError(f"per_core_N={per_core_n} needs more than {cores} cores (N={n}; minimum {min_per_core_n})")
     if out_block_w <= 0 or per_core_n % out_block_w:
         raise ValueError(f"out_block_w={out_block_w} must divide per_core_N={per_core_n} (N={n}, {cores} cores)")
     k_tiles = k // TILE

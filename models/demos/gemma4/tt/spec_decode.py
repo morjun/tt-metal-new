@@ -2011,6 +2011,10 @@ class SpeculativeDecoder:
             return out
         pad_mode = os.environ.get("GEMMA4_ARGMAX_PAD32", "").strip().lower()
         pad32 = pad_mode in ("1", "true", "yes", "on") or (pad_mode == "multirow" and rows > 1)
+        if logits.layout == ttnn.ROW_MAJOR_LAYOUT:
+            # The assistant's split lm_head (GEMMA4_ASSISTANT_LM_HEAD_L1_COLS) hands over its logits already
+            # untilized and joined, one row-major row per logical row.
+            return ttnn.argmax(logits, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM
         if not pad32:
             u = ttnn.untilize(logits, use_multicore=True)
             idx = ttnn.argmax(u, dim=-1, keepdim=False)  # [1,1,rows] uint32 RM

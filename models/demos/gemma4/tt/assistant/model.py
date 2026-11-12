@@ -36,12 +36,19 @@ Constraints (first cut):
 import os
 
 import torch
+from loguru import logger
 
 import ttnn
+from models.demos.gemma4.tt import lm_head_reload
 from models.demos.gemma4.tt.assistant.masked_embedding import Gemma4TTMaskedEmbedder
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.ccl import ccl_allgather
-from models.demos.gemma4.tt.decode_matmul import lm_head_out_block_w_config, lm_head_out_block_w_from_env
+from models.demos.gemma4.tt.decode_matmul import (
+    DecodeLinear,
+    flags_on,
+    lm_head_out_block_w_config,
+    lm_head_out_block_w_from_env,
+)
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
@@ -121,22 +128,30 @@ class Gemma4AssistantModel:
         # assistant's own sliding_window matches the target's -- 1024 for both
         # 12B and 31B -- so the ring size agrees). It still allocates NO KV of
         # its own: every layer runs is_kv_shared=True.
+        #
+        # GEMMA4_ASSISTANT_DECODE_1D=1 (opt-in): the drafter's wqkv / o_proj / gate_up / down and its pre_projection
+        # on the explicit 1D decode config (decode_matmul.DecodeLinear: K blocked by up to 8, N spread over the whole
+        # worker grid), without turning GEMMA4_MLP_DECODE_1D / GEMMA4_ATTN_DECODE_1D on for the target. It changes
+        # the drafter's rounding, so only the acceptance can move; the target's output cannot.
+        self._decode_1d = os.environ.get("GEMMA4_ASSISTANT_DECODE_1D", "0") == "1"
+        scoped = ("GEMMA4_MLP_DECODE_1D", "GEMMA4_ATTN_DECODE_1D") if self._decode_1d else ()
         self.layers = []
-        for i in range(self.text_args.num_hidden_layers):
-            layer = Gemma4DecoderLayer(
-                mesh_device=mesh_device,
-                hf_config=self.text_args,
-                state_dict=state_dict,
-                layer_idx=i,
-                ccl_manager=ccl_manager,
-                dtype=dtype,
-                tensor_cache_path=f"{tensor_cache_path}/layer_{i}" if tensor_cache_path else None,
-                mesh_config=mesh_config,
-                max_seq_len=self.text_args.max_seq_len,
-                max_local_batch_size=max_local_batch_size,
-                bounded_sliding_kv_cache=bounded_sliding_kv_cache,
-            )
-            self.layers.append(layer)
+        with flags_on(*scoped):
+            for i in range(self.text_args.num_hidden_layers):
+                layer = Gemma4DecoderLayer(
+                    mesh_device=mesh_device,
+                    hf_config=self.text_args,
+                    state_dict=state_dict,
+                    layer_idx=i,
+                    ccl_manager=ccl_manager,
+                    dtype=dtype,
+                    tensor_cache_path=f"{tensor_cache_path}/layer_{i}" if tensor_cache_path else None,
+                    mesh_config=mesh_config,
+                    max_seq_len=self.text_args.max_seq_len,
+                    max_local_batch_size=max_local_batch_size,
+                    bounded_sliding_kv_cache=bounded_sliding_kv_cache,
+                )
+                self.layers.append(layer)
 
         # Final norm (model.norm)
         self.norm = RMSNorm(
@@ -202,6 +217,15 @@ class Gemma4AssistantModel:
                 raise ValueError("Assistant checkpoint missing lm_head weights")
         if self.pre_projection is None or self.post_projection is None:
             raise ValueError("Assistant checkpoint missing pre_projection / post_projection weights")
+        # pre_projection (2 * backbone -> hidden, a long K: 7680 on the 12B) under GEMMA4_ASSISTANT_DECODE_1D:
+        # 107 -> 41 us per call. post_projection stays on the automatic config (DecodeLinear's is slower there).
+        self._pre_projection_linear = DecodeLinear(
+            self.pre_projection,
+            mesh_device,
+            k=int(self.pre_projection.shape[-2]),
+            n=int(self.pre_projection.shape[-1]),
+            enabled=self._decode_1d,
+        )
         # GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W (opt-in): fix out_block_w of the full-vocab lm_head, which otherwise runs
         # on ttnn's automatic config (decode_matmul.lm_head_out_block_w_config). Single chip only: at TP > 1 the head
         # is a vocab shard, a case this has not been measured on.
@@ -220,6 +244,155 @@ class Gemma4AssistantModel:
         self._logits_l1 = os.environ.get("GEMMA4_ASSISTANT_LOGITS_L1", "0") == "1"
         if self._logits_l1 and self._lm_head_out_block_w is None:
             raise ValueError("GEMMA4_ASSISTANT_LOGITS_L1=1 needs GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W")
+        # GEMMA4_ASSISTANT_LM_HEAD_PER_CORE_N (opt-in, with the out_block_w knob): N tiles per core of the DRAM-fed
+        # lm_head (the whole head, or the DRAM remainder of a split head).
+        pcn = (os.environ.get("GEMMA4_ASSISTANT_LM_HEAD_PER_CORE_N") or "").strip()
+        self._lm_head_per_core_n = int(pcn) if pcn else None
+        if self._lm_head_per_core_n is not None and self._lm_head_out_block_w is None:
+            raise ValueError("GEMMA4_ASSISTANT_LM_HEAD_PER_CORE_N needs GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W")
+        self.lm_head_l1 = None
+        self._split_lm_head_to_l1(mesh_device, tp)
+
+    def _split_lm_head_to_l1(self, mesh_device, tp):
+        """GEMMA4_ASSISTANT_LM_HEAD_L1_COLS (opt-in, default 0): pin the first ``cols`` vocab columns of the lm_head in
+        L1, WIDTH_SHARDED over the whole worker grid (``cols / 32 / cores`` N tiles per core), and keep the rest in
+        DRAM. The slice runs the 1D-multicast matmul on a local in1 shard with the automatic path's K blocking
+        (``in0_block_w`` 2, HiFi2, packer L1 accumulation), so every logit is computed as the unsplit head computes
+        it. ``step`` returns the two parts joined as one row-major row (see ``_join_split_logits``).
+
+        Whole tiles per core only (``cols`` a multiple of 32 x cores). The slice sits at the top of L1 on every
+        core; an op whose circular buffers reach into it fails ttnn's CB clash check, unless
+        GEMMA4_LMHEAD_L1_RELOAD brackets that op (tt/lm_head_reload.py)."""
+        cols = int(os.environ.get("GEMMA4_ASSISTANT_LM_HEAD_L1_COLS", "0"))
+        if cols <= 0:
+            return
+        if self.use_cme or tp > 1:
+            raise ValueError("GEMMA4_ASSISTANT_LM_HEAD_L1_COLS supports the dense lm_head on a single chip only")
+        if self._lm_head_out_block_w is None:
+            raise ValueError(
+                "GEMMA4_ASSISTANT_LM_HEAD_L1_COLS needs GEMMA4_ASSISTANT_LM_HEAD_OUT_BLOCK_W (the DRAM part)"
+            )
+        T = ttnn.TILE_SIZE
+        grid = mesh_device.compute_with_storage_grid_size()
+        cores = grid.x * grid.y
+        k = int(self.lm_head.shape[-2])
+        vocab = int(self.lm_head.shape[-1])
+        if cols % (T * cores) or cols >= vocab:
+            raise ValueError(
+                f"GEMMA4_ASSISTANT_LM_HEAD_L1_COLS={cols}: must be a multiple of {T * cores} (whole tiles on each of "
+                f"the {cores} cores) and below the vocab {vocab}"
+            )
+        per_core_n = cols // T // cores
+        kt = k // T
+        self._lm_head_l1_pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+            in0_block_w=2 if kt % 2 == 0 else 1,
+            out_subblock_h=1,
+            out_subblock_w=1,
+            out_block_h=1,
+            out_block_w=per_core_n,  # one output block per core: required for an L1-sharded in1
+            per_core_M=1,
+            per_core_N=per_core_n,
+            fuse_batch=True,
+            fused_activation=None,
+            mcast_in0=True,
+        )
+        self._lm_head_l1_ckc = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+        head = ttnn.slice(self.lm_head, [0, 0, 0, 0], [1, 1, k, cols])
+        tail = ttnn.slice(self.lm_head, [0, 0, 0, cols], [1, 1, k, vocab])
+        self.lm_head.deallocate(True)
+        self.lm_head = tail  # the DRAM remainder keeps the attribute
+        shard = ttnn.ShardSpec(
+            ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))}),
+            [k, cols // cores],
+            ttnn.ShardOrientation.ROW_MAJOR,
+        )
+        self.lm_head_l1 = ttnn.to_memory_config(
+            head, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, shard)
+        )
+        head.deallocate(True)
+        charge = k * T * per_core_n * self.lm_head_l1.element_size()
+        logger.info(
+            f"[lm_head-split] {cols}/{vocab} columns in L1 on {grid.x}x{grid.y}={cores} cores, per_core_N={per_core_n}, "
+            f"{charge} B per core at address {self.lm_head_l1.buffer_address()}"
+        )
+        lm_head_reload.register(self, "lm_head_l1", mesh_device)
+
+    def _join_split_logits(self, head, tail):
+        """The split head's two parts as one row-major ``[1, 1, 1, vocab]`` DRAM row, in vocab order: each part is
+        untilized (which drops the 31 padding rows of its tile), then copied into the joined row by a custom kernel
+        (kernels/join_row_bytes.cpp). ``ttnn.concat`` would stage the whole 524 KiB row in L1 on one core, on top of
+        the pinned slice there; the kernel uses a 16 KiB scratch per core. The token pick
+        (``spec_decode._argmax_last``) takes a row-major row as it is."""
+
+        def untilize(part):
+            if part.memory_config().buffer_type != ttnn.BufferType.L1:
+                return ttnn.untilize(part, use_multicore=True)
+            # ttnn.untilize drops the tile padding only for a DRAM input.
+            end = [d - 1 for d in part.shape]
+            return ttnn.untilize_with_unpadding(part, end, memory_config=ttnn.DRAM_MEMORY_CONFIG, use_multicore=True)
+
+        rows = [untilize(head), untilize(tail)]
+        head.deallocate(True)
+        tail.deallocate(True)
+        joined = ttnn.allocate_tensor_on_device(
+            ttnn.Shape([1, 1, 1, self.vocab_size]),
+            rows[0].dtype,
+            ttnn.ROW_MAJOR_LAYOUT,
+            self.mesh_device,
+            ttnn.DRAM_MEMORY_CONFIG,
+        )
+        elem = rows[0].element_size()
+        dst_off = 0
+        for i, row in enumerate(rows):
+            ttnn.generic_op([row, joined], self._join_program(i, row, joined, dst_off))
+            dst_off += int(row.shape[-1]) * elem
+        for r in rows:
+            r.deallocate(True)
+        return joined
+
+    _JOIN_CHUNK = 16384  # scratch bytes per core
+    _JOIN_CORES = (2, 8)  # cores copying the L1 part's row and the DRAM part's row
+
+    def _join_program(self, part, row, joined, dst_off):
+        """Program copying ``row`` into ``joined`` at byte ``dst_off``, split over this part's cores (the first
+        cores of the last grid row for part 0, the next ones for part 1)."""
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        n = self._JOIN_CORES[part]
+        first = sum(self._JOIN_CORES[:part])
+        cores = [(first + i, grid.y - 1) for i in range(n)]
+        crs = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in cores])
+        nbytes = int(row.shape[-1]) * row.element_size()
+        per_core = -(-nbytes // n // 64) * 64
+        rt = ttnn.RuntimeArgs()
+        for i, (x, y) in enumerate(cores):
+            off = min(i * per_core, nbytes)
+            rt[x][y] = [row.buffer_address(), joined.buffer_address(), off, dst_off + off, min(per_core, nbytes - off)]
+        ct = [self._JOIN_CHUNK, nbytes, int(joined.shape[-1]) * joined.element_size()]
+        ct += list(ttnn.TensorAccessorArgs(row).get_compile_time_args())
+        ct += list(ttnn.TensorAccessorArgs(joined).get_compile_time_args())
+        kernel = ttnn.KernelDescriptor(
+            kernel_source="models/demos/gemma4/tt/assistant/kernels/join_row_bytes.cpp",
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=crs,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        )
+        scratch = ttnn.CBDescriptor(
+            total_size=self._JOIN_CHUNK,
+            core_ranges=crs,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=self._JOIN_CHUNK)
+            ],
+        )
+        return ttnn.ProgramDescriptor(kernels=[kernel], semaphores=[], cbs=[scratch])
 
     def _lm_head_configs(self, x):
         """(program_config, compute_kernel_config) of the lm_head call: (None, None) = ttnn's automatic config."""
@@ -233,6 +406,7 @@ class Gemma4AssistantModel:
                 out_block_w=self._lm_head_out_block_w,
                 x_dtype=x.dtype,
                 w_dtype=self.lm_head.dtype,
+                per_core_n=self._lm_head_per_core_n,
             )
         return self._lm_head_cfg
 
@@ -330,8 +504,10 @@ class Gemma4AssistantModel:
         inp = ttnn.concat([tok_embed, target_hidden], dim=-1)
         tok_embed.deallocate(True)
 
-        h = ttnn.linear(inp, self.pre_projection)
+        h = self._pre_projection_linear(inp)
         inp.deallocate(True)
+
+        lm_head_reload.drafter_step()  # no-op unless GEMMA4_LMHEAD_L1_RELOAD
 
         for i, layer in enumerate(self.layers):
             lt = self.layer_types[i]
@@ -361,6 +537,21 @@ class Gemma4AssistantModel:
             if self.use_cme:
                 # Replicated weights, ~4096-wide output: no all-gather needed.
                 logits = self.masked_embedding.forward(normed)
+            elif self.lm_head_l1 is not None:
+                logits_mc = ttnn.L1_MEMORY_CONFIG if self._logits_l1 else None
+                lm_head_reload.reload()  # no-op unless GEMMA4_LMHEAD_L1_RELOAD
+                head = ttnn.linear(
+                    normed,
+                    self.lm_head_l1,
+                    program_config=self._lm_head_l1_pc,
+                    compute_kernel_config=self._lm_head_l1_ckc,
+                    memory_config=logits_mc,
+                )
+                pc, ckc = self._lm_head_configs(normed)
+                tail = ttnn.linear(
+                    normed, self.lm_head, program_config=pc, compute_kernel_config=ckc, memory_config=logits_mc
+                )
+                logits = self._join_split_logits(head, tail)
             else:
                 pc, ckc = self._lm_head_configs(normed)
                 logits = ttnn.linear(
