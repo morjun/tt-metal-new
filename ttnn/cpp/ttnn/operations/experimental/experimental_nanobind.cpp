@@ -70,6 +70,7 @@
 #include "ttnn/operations/experimental/transformer/all_reduce_create_qkv_heads/all_reduce_create_qkv_heads_nanobind.hpp"
 #include "ttnn/operations/experimental/padded_slice/padded_slice_nanobind.hpp"
 #include "ttnn/operations/experimental/tensor_prefetcher/tensor_prefetcher_nanobind.hpp"
+#include "ttnn/operations/experimental/tensor_prefetcher/resident_drisc_nanobind.hpp"
 #include "ttnn/operations/experimental/test/hang_device/hang_device_operation_nanobind.hpp"
 #include "ttnn/operations/experimental/test/prefetcher_consumer/dram_prefetcher_consumer_nanobind.hpp"
 #include "ttnn/operations/experimental/minimal_matmul/minimal_matmul_nanobind.hpp"
@@ -217,6 +218,7 @@ void py_module(nb::module_& mod) {
     // signatures print the Python type rather than a mangled C++ one.
     bind_tensor_prefetcher(mod);
     test::bind_test_dram_prefetcher_consumer(mod);
+    bind_resident_drisc(mod);
 
     // CCL ops
     fabric_mux::bind_fabric_mux(mod);

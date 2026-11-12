@@ -3559,7 +3559,32 @@ void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_
     // outright, since this is called on every enqueue and the guards alone cost microseconds per
     // program. Validation still reads live device state. In the lockstep case,
     // one L1 frontier covers all static CB and DFB regions.
+    // RESEARCH (gemma4-12b record 5.5.14): during a graph capture, report this program's static L1 regions (circular
+    // buffers, dataflow buffers and scratchpads; resolved addresses per lockstep core range) on every enqueue, as
+    // circular_buffer_allocate nodes. A program cached before the capture started reports nothing otherwise, and
+    // dataflow buffers are never reported with their addresses. models/demos/gemma4/tt/lm_head_reload.py reads them.
+    const auto report_static_l1_regions = [this, device]() {
+        auto& tracker = tt::tt_metal::GraphTracker::instance();
+        if (!tracker.is_enabled()) {
+            return;
+        }
+        for (const auto* metadata : {&this->cb_allocation_metadata_, &this->dfb_allocation_metadata_}) {
+            for (const auto& region : metadata->regions) {
+                for (const auto& [start, end] : region.l1_regions) {
+                    if (end > start) {
+                        tracker.track_allocate_cb(
+                            CoreRangeSet(region.core_range),
+                            start,
+                            end - start,
+                            /*is_globally_allocated=*/false,
+                            device);
+                    }
+                }
+            }
+        }
+    };
     if (not this->compile_and_allocate_needed_ and this->compile_and_allocate_device_ == device) {
+        report_static_l1_regions();
         if (this->simple_l1_validation_usable(device)) {
             if (this->simple_l1_validation_region_end_ == 0) {
                 return;
@@ -3608,6 +3633,7 @@ void detail::ProgramImpl::compile_and_allocate(IDevice* device, bool force_slow_
         }
     }
 
+    report_static_l1_regions();
     this->compile_and_allocate_needed_ = false;
     this->compile_and_allocate_device_ = device;
 }
