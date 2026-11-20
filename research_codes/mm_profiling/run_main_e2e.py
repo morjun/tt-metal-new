@@ -70,7 +70,9 @@ def parse(log):
         "accepted_per_3": get(r"mean accepted ([\d.]+)/3"),
         # steady state: everything after the first iteration (which carries the trace capture)
         "iterations": int(rem.group(3)) + 1 if rem else None,
-        "ms_per_iteration": round(float(rem.group(1)) * 1e3 / int(rem.group(3)), 3) if rem else None,
+        "ms_per_iteration": round(float(rem.group(1)) * 1e3 / int(rem.group(3)), 3)
+        if rem and int(rem.group(3))
+        else None,
         "tokens_per_s": get(r"Steady decode: ([\d.]+) tok/s/user"),
         "route": get(r"Effective route: ([\w-]+)", str),
         "text_sha256": hashlib.sha256(text.group(1).strip().encode()).hexdigest()[:16] if text else None,
@@ -89,6 +91,7 @@ def main():
     p.add_argument("--no-bos", action="store_true", help="drop the literal <bos> from the prompt")
     p.add_argument("--prompts-json", type=Path, help="run every arm on the first --prompt-count prompts of this file")
     p.add_argument("--prompt-count", type=int, default=8)
+    p.add_argument("--env", action="append", default=[], help="K=V added to every cell (e.g. a precision override)")
     p.add_argument("--test", default="models/demos/gemma4/demo/text_demo_v2.py")
     p.add_argument("-k", default="test_demo_spec_decode")
     args = p.parse_args()
@@ -112,6 +115,7 @@ def main():
     results = []
     for i, (label, extra) in enumerate(order):
         env = base_env(args.repo, bos=not args.no_bos)
+        env.update(dict(kv.split("=", 1) for kv in args.env))
         env.update(extra, TT_VISIBLE_DEVICES=str(args.device))
         name = f"{i:02d}_{label}"
         print("running", name, extra, flush=True)
@@ -137,7 +141,9 @@ def main():
             },
             flush=True,
         )
-        if proc.returncode != 0 or (row["generated_tokens"] != 500 and not args.prompts_json):
+        if proc.returncode != 0 or (
+            row["generated_tokens"] != int(env["GEMMA4_MAX_NEW_TOKENS"]) and not args.prompts_json
+        ):
             raise SystemExit(f"cell {name} failed (exit {proc.returncode}, tokens {row['generated_tokens']})")
         if args.class_c and label != "warmup":
             keys = {(r["text_sha256"], r["accepted_per_3"], r["iterations"]) for r in results if r["arm"] != "warmup"}

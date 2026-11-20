@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--census")
     ap.add_argument("--modes", action="store_true")
+    ap.add_argument(
+        "--profile-replays", type=int, default=0, help="untimed: N replays, device profiler read after each"
+    )
     cli = ap.parse_args()
     ctx, max_seq_len = cli.ctx, cli.max_seq_len
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), trace_region_size=64_000_000)
@@ -191,6 +194,23 @@ def main():
             l1 = sorted({(int(r["address"]), int(r["size"]), r["op"]) for r in rows if r["kind"] == "l1"})
             for addr, size, name in l1[:25]:
                 print(f"CENSUS l1_buffer addr={addr} size={size} op={name}", flush=True)
+            return
+        if cli.profile_replays:  # per-op device profile of traced replays (run under tracy; record §8)
+            body("full")
+            ttnn.synchronize_device(mesh)
+            ttnn.ReadDeviceProfiler(mesh)
+            tid = ttnn.begin_trace_capture(mesh, cq_id=0)
+            idx, h = body("full")
+            ttnn.end_trace_capture(mesh, tid, cq_id=0)
+            ttnn.synchronize_device(mesh)
+            ttnn.ReadDeviceProfiler(mesh)
+            for _ in range(cli.profile_replays):
+                ttnn.execute_trace(mesh, tid, cq_id=0, blocking=True)
+                ttnn.ReadDeviceProfiler(mesh)
+            tok = ttnn.to_torch(idx).flatten()[:1].tolist()
+            sha = hashlib.sha256(ttnn.to_torch(h).float().numpy().tobytes()).hexdigest()[:16]
+            print(f"PROFILED replays={cli.profile_replays} token={tok} hidden_sha={sha}", flush=True)
+            ttnn.release_trace(mesh, tid)
             return
         for rnd in range(cli.rounds):
             ms, fp = timed("full")

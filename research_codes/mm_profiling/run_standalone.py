@@ -48,6 +48,7 @@ def main():
     p.add_argument("--class-c", action="store_true")
     p.add_argument("--census", action="store_true")
     p.add_argument("--modes", action="store_true")
+    p.add_argument("--env", action="append", default=[], help="K=V added to every cell")
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     lock = open(f"/tmp/gemma4-gather-device{args.device}.lock", "w")
@@ -61,6 +62,7 @@ def main():
     for i, arm in enumerate(order):
         env = base_env(args.device)
         env.update(arm_env(arm))
+        env.update(dict(kv.split("=", 1) for kv in args.env))
         name = f"{i:02d}_{arm}"
         cmd = [py, str(Path(__file__).parent / "standalone_draft.py"), str(args.ctx), str(args.max_seq_len)]
         cmd += ["--census", str(args.output / f"{name}.census.json")] if args.census else ["--rounds", "1"]

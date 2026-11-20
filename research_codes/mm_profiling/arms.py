@@ -2,7 +2,10 @@
 
 Grammar (l1w's run_pin_reload_standalone.arm_spec, mapped to this branch's knobs): <base>[+<suffix>...]
 
-  base  M                                main as it is: every lm_head on ttnn's automatic config
+  base  M                                this branch's defaults: every lm_head on ttnn's automatic config, and both
+                                         PRs' default-on changes (token pick without the pad to 32 rows, PR #64775)
+                                         M+pad32 is upstream main's behaviour on 12B (the other default-on PR
+                                         changes act on E2B / multi-user routes only)
         B                                drafter lm_head out_block_w 5, target lm_head out_block_w 3
         H<pcN>_<ow>                      whole drafter head in DRAM at per_core_N / out_block_w
         P<cols>_<pcN>_<ow>               drafter head: first <cols> columns pinned in L1, DRAM remainder at pcN / ow
@@ -17,6 +20,8 @@ Grammar (l1w's run_pin_reload_standalone.arm_spec, mapped to this branch's knobs
                                          l1w's own tuner, so it has no counterpart here
          +vc<mode>                       read-request VC mode of the 1D-multicast in1 reader (1 = by row)
          +vcrow<k> / +vccol<k> / +vcbank<k> / +vcfix<k>
+         +pad32                          token pick on the logits padded to 32 rows (upstream main's path; drafter
+                                         and target verify)
 
 The anchor of this branch is named in CLAUDE.md.
 """
@@ -68,6 +73,8 @@ def arm_env(arm: str) -> dict:
         elif v := re.fullmatch(r"vc(row|col|diag|bank|fix)?(\d+)", s):
             kind = {None: 0, "row": 1, "col": 2, "diag": 3, "bank": 4, "fix": 5}[v.group(1)]
             env["TT_MM1D_IN1_VC_MODE"] = str(kind * 16 + int(v.group(2)))
+        elif s == "pad32":
+            env["GEMMA4_ARGMAX_PAD32"] = "1"
         else:
             raise ValueError(f"unknown suffix +{s} in {arm!r}")
     return env
